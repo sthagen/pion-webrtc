@@ -13,6 +13,7 @@ import (
 )
 
 type trackDetails struct {
+	mid   string
 	kind  RTPCodecType
 	label string
 	id    string
@@ -33,6 +34,11 @@ func trackDetailsFromSDP(log logging.LeveledLogger, s *sdp.SessionDescription) m
 		if _, ok := media.Attribute(sdp.AttrKeyRecvOnly); ok {
 			continue
 		} else if _, ok := media.Attribute(sdp.AttrKeyInactive); ok {
+			continue
+		}
+
+		midValue := getMidValue(media)
+		if midValue == "" {
 			continue
 		}
 
@@ -97,7 +103,7 @@ func trackDetailsFromSDP(log logging.LeveledLogger, s *sdp.SessionDescription) m
 
 				// Plan B might send multiple a=ssrc lines under a single m= section. This is also why a single trackDetails{}
 				// is not defined at the top of the loop over s.MediaDescriptions.
-				incomingTracks[uint32(ssrc)] = trackDetails{codecType, trackLabel, trackID, uint32(ssrc)}
+				incomingTracks[uint32(ssrc)] = trackDetails{midValue, codecType, trackLabel, trackID, uint32(ssrc)}
 			}
 		}
 	}
@@ -142,7 +148,7 @@ func addCandidatesToMediaDescriptions(candidates []ICECandidate, m *sdp.MediaDes
 func addDataMediaSection(d *sdp.SessionDescription, midValue string, iceParams ICEParameters, candidates []ICECandidate, dtlsRole sdp.ConnectionRole, iceGatheringState ICEGatheringState) {
 	media := (&sdp.MediaDescription{
 		MediaName: sdp.MediaName{
-			Media:   "application",
+			Media:   mediaSectionApplication,
 			Port:    sdp.RangedPort{Value: 9},
 			Protos:  []string{"DTLS", "SCTP"},
 			Formats: []string{"5000"},
@@ -397,4 +403,14 @@ func extractICEDetails(desc *sdp.SessionDescription) (string, string, []ICECandi
 	}
 
 	return remoteUfrag, remotePwd, candidates, nil
+}
+
+func haveApplicationMediaSection(desc *sdp.SessionDescription) bool {
+	for _, m := range desc.MediaDescriptions {
+		if m.MediaName.Media == mediaSectionApplication {
+			return true
+		}
+	}
+
+	return false
 }

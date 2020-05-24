@@ -58,11 +58,6 @@ func TestPeerConnection_Media_Sample(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = pcAnswer.AddTransceiverFromKind(RTPCodecTypeVideo)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	awaitRTPRecv := make(chan bool)
 	awaitRTPRecvClosed := make(chan bool)
 	awaitRTPSend := make(chan bool)
@@ -130,7 +125,7 @@ func TestPeerConnection_Media_Sample(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rtpReceiver, err := pcOffer.AddTrack(vp8Track)
+	rtpSender, err := pcOffer.AddTrack(vp8Track)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +163,7 @@ func TestPeerConnection_Media_Sample(t *testing.T) {
 	}()
 
 	go func() {
-		if _, routineErr := rtpReceiver.Read(make([]byte, 1400)); routineErr == nil {
+		if _, routineErr := rtpSender.Read(make([]byte, 1400)); routineErr == nil {
 			close(awaitRTCPSenderRecv)
 		}
 	}()
@@ -1070,6 +1065,140 @@ func TestPlanBMultiTrack(t *testing.T) {
 			}
 		}
 	}()
+
+	assert.NoError(t, pcOffer.Close())
+	assert.NoError(t, pcAnswer.Close())
+}
+
+// TestPeerConnection_Start_Only_Negotiated_Senders tests that only
+// the current negotiated transceivers senders provided in an
+// offer/answer are started
+func TestPeerConnection_Start_Only_Negotiated_Senders(t *testing.T) {
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	pcOffer, err := NewPeerConnection(Configuration{})
+	assert.NoError(t, err)
+	defer func() { assert.NoError(t, pcOffer.Close()) }()
+
+	pcAnswer, err := NewPeerConnection(Configuration{})
+	assert.NoError(t, err)
+	defer func() { assert.NoError(t, pcAnswer.Close()) }()
+
+	track1, err := pcOffer.NewTrack(DefaultPayloadTypeVP8, rand.Uint32(), "video", "pion1")
+	require.NoError(t, err)
+
+	sender1, err := pcOffer.AddTrack(track1)
+	require.NoError(t, err)
+
+	offer, err := pcOffer.CreateOffer(nil)
+	assert.NoError(t, err)
+
+	assert.NoError(t, pcOffer.SetLocalDescription(offer))
+	assert.NoError(t, pcAnswer.SetRemoteDescription(offer))
+	answer, err := pcAnswer.CreateAnswer(nil)
+	assert.NoError(t, err)
+	assert.NoError(t, pcAnswer.SetLocalDescription(answer))
+
+	// Add a new track between providing the offer and applying the answer
+
+	track2, err := pcOffer.NewTrack(DefaultPayloadTypeVP8, rand.Uint32(), "video", "pion2")
+	require.NoError(t, err)
+
+	sender2, err := pcOffer.AddTrack(track2)
+	require.NoError(t, err)
+
+	// apply answer so we'll test generateMatchedSDP
+	assert.NoError(t, pcOffer.SetRemoteDescription(answer))
+
+	// Wait for senders to be started by startTransports spawned goroutine
+	<-pcOffer.ops.Done()
+
+	// sender1 should be started but sender2 should not be started
+	assert.True(t, sender1.hasSent(), "sender1 is not started but should be started")
+	assert.False(t, sender2.hasSent(), "sender2 is started but should not be started")
+}
+
+// TestPeerConnection_Start_Right_Receiver tests that the right
+// receiver (the receiver which transceiver has the same media section as the track)
+// is started for the specified track
+func TestPeerConnection_Start_Right_Receiver(t *testing.T) {
+	isTransceiverReceiverStarted := func(pc *PeerConnection, mid string) (bool, error) {
+		for _, transceiver := range pc.GetTransceivers() {
+			if transceiver.Mid() != mid {
+				continue
+			}
+			return transceiver.Receiver() != nil && transceiver.Receiver().haveReceived(), nil
+		}
+		return false, fmt.Errorf("no transceiver with mid %q", mid)
+	}
+
+	api := NewAPI()
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	api.mediaEngine.RegisterDefaultCodecs()
+	pcOffer, pcAnswer, err := api.newPair(Configuration{})
+	require.NoError(t, err)
+
+	_, err = pcAnswer.AddTransceiverFromKind(RTPCodecTypeVideo, RtpTransceiverInit{Direction: RTPTransceiverDirectionRecvonly})
+	assert.NoError(t, err)
+
+	track1, err := pcOffer.NewTrack(DefaultPayloadTypeVP8, rand.Uint32(), "video", "pion1")
+	require.NoError(t, err)
+
+	sender1, err := pcOffer.AddTrack(track1)
+	require.NoError(t, err)
+
+	assert.NoError(t, signalPair(pcOffer, pcAnswer))
+
+	<-pcOffer.ops.Done()
+	<-pcAnswer.ops.Done()
+
+	// transceiver with mid 0 should be started
+	started, err := isTransceiverReceiverStarted(pcAnswer, "0")
+	assert.NoError(t, err)
+	assert.True(t, started, "transceiver with mid 0 should be started")
+
+	// Remove track
+	assert.NoError(t, pcOffer.RemoveTrack(sender1))
+
+	assert.NoError(t, signalPair(pcOffer, pcAnswer))
+
+	<-pcOffer.ops.Done()
+	<-pcAnswer.ops.Done()
+
+	// transceiver with mid 0 should not be started
+	started, err = isTransceiverReceiverStarted(pcAnswer, "0")
+	assert.NoError(t, err)
+	assert.False(t, started, "transceiver with mid 0 should not be started")
+
+	// Add a new transceiver (we're not using AddTrack since it'll reuse the transceiver with mid 0)
+	_, err = pcOffer.AddTransceiverFromTrack(track1)
+	assert.NoError(t, err)
+
+	_, err = pcAnswer.AddTransceiverFromKind(RTPCodecTypeVideo, RtpTransceiverInit{Direction: RTPTransceiverDirectionRecvonly})
+	assert.NoError(t, err)
+
+	assert.NoError(t, signalPair(pcOffer, pcAnswer))
+
+	<-pcOffer.ops.Done()
+	<-pcAnswer.ops.Done()
+
+	// transceiver with mid 0 should not be started
+	started, err = isTransceiverReceiverStarted(pcAnswer, "0")
+	assert.NoError(t, err)
+	assert.False(t, started, "transceiver with mid 0 should not be started")
+	// transceiver with mid 2 should be started
+	started, err = isTransceiverReceiverStarted(pcAnswer, "2")
+	assert.NoError(t, err)
+	assert.True(t, started, "transceiver with mid 2 should be started")
 
 	assert.NoError(t, pcOffer.Close())
 	assert.NoError(t, pcAnswer.Close())
