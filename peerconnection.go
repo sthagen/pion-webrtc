@@ -18,8 +18,8 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/sdp/v2"
 
-	"github.com/pion/webrtc/v2/internal/util"
-	"github.com/pion/webrtc/v2/pkg/rtcerr"
+	"github.com/pion/webrtc/v3/internal/util"
+	"github.com/pion/webrtc/v3/pkg/rtcerr"
 )
 
 // PeerConnection represents a WebRTC connection that establishes a
@@ -1769,10 +1769,10 @@ func (pc *PeerConnection) generateUnmatchedSDP(useIdentity bool) (*sdp.SessionDe
 			}
 		}
 
-		if len(video) > 1 {
+		if len(video) > 0 {
 			mediaSections = append(mediaSections, mediaSection{id: "video", transceivers: video})
 		}
-		if len(audio) > 1 {
+		if len(audio) > 0 {
 			mediaSections = append(mediaSections, mediaSection{id: "audio", transceivers: audio})
 		}
 		mediaSections = append(mediaSections, mediaSection{id: "data", data: true})

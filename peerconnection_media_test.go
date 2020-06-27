@@ -17,7 +17,7 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/sdp/v2"
 	"github.com/pion/transport/test"
-	"github.com/pion/webrtc/v2/pkg/media"
+	"github.com/pion/webrtc/v3/pkg/media"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -811,6 +811,31 @@ func TestAddTransceiverAddTrack_NewRTPSender_Error(t *testing.T) {
 	assert.NoError(t, pc.Close())
 }
 
+func TestRtpSenderReceiver_ReadClose_Error(t *testing.T) {
+	mediaEngine := MediaEngine{}
+	mediaEngine.RegisterDefaultCodecs()
+	api := NewAPI(WithMediaEngine(mediaEngine))
+	pc, err := api.NewPeerConnection(Configuration{})
+	assert.NoError(t, err)
+
+	tr, err := pc.AddTransceiverFromKind(
+		RTPCodecTypeVideo,
+		RtpTransceiverInit{Direction: RTPTransceiverDirectionSendrecv},
+	)
+	assert.NoError(t, err)
+
+	sender, receiver := tr.Sender(), tr.Receiver()
+	assert.NoError(t, sender.Stop())
+	_, err = sender.Read(make([]byte, 0, 1400))
+	assert.Error(t, err, io.ErrClosedPipe)
+
+	assert.NoError(t, receiver.Stop())
+	_, err = receiver.Read(make([]byte, 0, 1400))
+	assert.Error(t, err, io.ErrClosedPipe)
+
+	assert.NoError(t, pc.Close())
+}
+
 // nolint: dupl
 func TestAddTransceiverFromKind(t *testing.T) {
 	lim := test.TimeOut(time.Second * 30)
@@ -1011,15 +1036,61 @@ func TestGetRegisteredRTPCodecs(t *testing.T) {
 	assert.NoError(t, pc.Close())
 }
 
-func TestPlanBMultiTrack(t *testing.T) {
-	addSingleTrack := func(p *PeerConnection) *Track {
-		track, err := p.NewTrack(DefaultPayloadTypeVP8, rand.Uint32(), fmt.Sprintf("video-%d", rand.Uint32()), fmt.Sprintf("video-%d", rand.Uint32()))
+func TestPlanBMediaExchange(t *testing.T) {
+	runTest := func(trackCount int, t *testing.T) {
+		addSingleTrack := func(p *PeerConnection) *Track {
+			track, err := p.NewTrack(DefaultPayloadTypeVP8, rand.Uint32(), fmt.Sprintf("video-%d", rand.Uint32()), fmt.Sprintf("video-%d", rand.Uint32()))
+			assert.NoError(t, err)
+
+			_, err = p.AddTrack(track)
+			assert.NoError(t, err)
+
+			return track
+		}
+
+		pcOffer, err := NewPeerConnection(Configuration{SDPSemantics: SDPSemanticsPlanB})
 		assert.NoError(t, err)
 
-		_, err = p.AddTrack(track)
+		pcAnswer, err := NewPeerConnection(Configuration{SDPSemantics: SDPSemanticsPlanB})
 		assert.NoError(t, err)
 
-		return track
+		var onTrackWaitGroup sync.WaitGroup
+		onTrackWaitGroup.Add(trackCount)
+		pcAnswer.OnTrack(func(track *Track, r *RTPReceiver) {
+			onTrackWaitGroup.Done()
+		})
+
+		done := make(chan struct{})
+		go func() {
+			onTrackWaitGroup.Wait()
+			close(done)
+		}()
+
+		_, err = pcAnswer.AddTransceiverFromKind(RTPCodecTypeVideo)
+		assert.NoError(t, err)
+
+		outboundTracks := []*Track{}
+		for i := 0; i < trackCount; i++ {
+			outboundTracks = append(outboundTracks, addSingleTrack(pcOffer))
+		}
+
+		assert.NoError(t, signalPair(pcOffer, pcAnswer))
+
+		func() {
+			for {
+				select {
+				case <-time.After(20 * time.Millisecond):
+					for _, track := range outboundTracks {
+						assert.NoError(t, track.WriteSample(media.Sample{Data: []byte{0x00}, Samples: 1}))
+					}
+				case <-done:
+					return
+				}
+			}
+		}()
+
+		assert.NoError(t, pcOffer.Close())
+		assert.NoError(t, pcAnswer.Close())
 	}
 
 	lim := test.TimeOut(time.Second * 30)
@@ -1028,46 +1099,12 @@ func TestPlanBMultiTrack(t *testing.T) {
 	report := test.CheckRoutines(t)
 	defer report()
 
-	pcOffer, err := NewPeerConnection(Configuration{SDPSemantics: SDPSemanticsPlanB})
-	assert.NoError(t, err)
-
-	pcAnswer, err := NewPeerConnection(Configuration{SDPSemantics: SDPSemanticsPlanB})
-	assert.NoError(t, err)
-
-	var onTrackWaitGroup sync.WaitGroup
-	onTrackWaitGroup.Add(2)
-	pcAnswer.OnTrack(func(track *Track, r *RTPReceiver) {
-		onTrackWaitGroup.Done()
+	t.Run("Single Track", func(t *testing.T) {
+		runTest(1, t)
 	})
-
-	done := make(chan struct{})
-	go func() {
-		onTrackWaitGroup.Wait()
-		close(done)
-	}()
-
-	_, err = pcAnswer.AddTransceiverFromKind(RTPCodecTypeVideo)
-	assert.NoError(t, err)
-
-	track1 := addSingleTrack(pcOffer)
-	track2 := addSingleTrack(pcOffer)
-
-	assert.NoError(t, signalPair(pcOffer, pcAnswer))
-
-	func() {
-		for {
-			select {
-			case <-time.After(20 * time.Millisecond):
-				assert.NoError(t, track1.WriteSample(media.Sample{Data: []byte{0x00}, Samples: 1}))
-				assert.NoError(t, track2.WriteSample(media.Sample{Data: []byte{0x00}, Samples: 1}))
-			case <-done:
-				return
-			}
-		}
-	}()
-
-	assert.NoError(t, pcOffer.Close())
-	assert.NoError(t, pcAnswer.Close())
+	t.Run("Multi Track", func(t *testing.T) {
+		runTest(2, t)
+	})
 }
 
 // TestPeerConnection_Start_Only_Negotiated_Senders tests that only
@@ -1115,7 +1152,7 @@ func TestPeerConnection_Start_Only_Negotiated_Senders(t *testing.T) {
 	assert.NoError(t, pcOffer.SetRemoteDescription(answer))
 
 	// Wait for senders to be started by startTransports spawned goroutine
-	<-pcOffer.ops.Done()
+	pcOffer.ops.Done()
 
 	// sender1 should be started but sender2 should not be started
 	assert.True(t, sender1.hasSent(), "sender1 is not started but should be started")
@@ -1158,8 +1195,8 @@ func TestPeerConnection_Start_Right_Receiver(t *testing.T) {
 
 	assert.NoError(t, signalPair(pcOffer, pcAnswer))
 
-	<-pcOffer.ops.Done()
-	<-pcAnswer.ops.Done()
+	pcOffer.ops.Done()
+	pcAnswer.ops.Done()
 
 	// transceiver with mid 0 should be started
 	started, err := isTransceiverReceiverStarted(pcAnswer, "0")
@@ -1171,8 +1208,8 @@ func TestPeerConnection_Start_Right_Receiver(t *testing.T) {
 
 	assert.NoError(t, signalPair(pcOffer, pcAnswer))
 
-	<-pcOffer.ops.Done()
-	<-pcAnswer.ops.Done()
+	pcOffer.ops.Done()
+	pcAnswer.ops.Done()
 
 	// transceiver with mid 0 should not be started
 	started, err = isTransceiverReceiverStarted(pcAnswer, "0")
@@ -1188,8 +1225,8 @@ func TestPeerConnection_Start_Right_Receiver(t *testing.T) {
 
 	assert.NoError(t, signalPair(pcOffer, pcAnswer))
 
-	<-pcOffer.ops.Done()
-	<-pcAnswer.ops.Done()
+	pcOffer.ops.Done()
+	pcAnswer.ops.Done()
 
 	// transceiver with mid 0 should not be started
 	started, err = isTransceiverReceiverStarted(pcAnswer, "0")

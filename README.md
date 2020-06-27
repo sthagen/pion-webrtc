@@ -9,10 +9,11 @@
   <a href="https://pion.ly"><img src="https://img.shields.io/badge/pion-webrtc-gray.svg?longCache=true&colorB=brightgreen" alt="Pion webrtc"></a>
   <a href="https://sourcegraph.com/github.com/pion/webrtc?badge"><img src="https://sourcegraph.com/github.com/pion/webrtc/-/badge.svg" alt="Sourcegraph Widget"></a>
   <a href="https://pion.ly/slack"><img src="https://img.shields.io/badge/join-us%20on%20slack-gray.svg?longCache=true&logo=slack&colorB=brightgreen" alt="Slack Widget"></a>
+  <a href="https://twitter.com/_pion?ref_src=twsrc%5Etfw"><img src="https://img.shields.io/twitter/url.svg?label=Follow%20%40_pion&style=social&url=https%3A%2F%2Ftwitter.com%2F_pion" alt="Twitter Widget"></a>
   <a href="https://github.com/pion/awesome-pion" alt="Awesome Pion"><img src="https://cdn.rawgit.com/sindresorhus/awesome/d7305f38d29fed78fa85652e3a63e154dd8e8829/media/badge.svg"></a>
   <br>
   <a href="https://travis-ci.org/pion/webrtc"><img src="https://travis-ci.org/pion/webrtc.svg?branch=master" alt="Build Status"></a>
-  <a href="https://pkg.go.dev/github.com/pion/webrtc/v2"><img src="https://godoc.org/github.com/pion/webrtc?status.svg" alt="GoDoc"></a>
+  <a href="https://pkg.go.dev/github.com/pion/webrtc/v3"><img src="https://godoc.org/github.com/pion/webrtc?status.svg" alt="GoDoc"></a>
   <a href="https://codecov.io/gh/pion/webrtc"><img src="https://codecov.io/gh/pion/webrtc/branch/master/graph/badge.svg" alt="Coverage Status"></a>
   <a href="https://goreportcard.com/report/github.com/pion/webrtc"><img src="https://goreportcard.com/badge/github.com/pion/webrtc" alt="Go Report Card"></a>
   <a href="https://www.codacy.com/app/Sean-Der/webrtc"><img src="https://api.codacy.com/project/badge/Grade/18f4aec384894e6aac0b94effe51961d" alt="Codacy Badge"></a>
@@ -157,7 +158,13 @@ Check out the **[contributing wiki](https://github.com/pion/webrtc/wiki/Contribu
 * [Simone Gotti](https://github.com/sgotti)
 * [Cedric Fung](https://github.com/cedricfung)
 * [Norman Rasmussen](https://github.com/normanr) - *Fix Empty DataChannel messages*
-* [Josh Bleecher Snyder](https://github.com/josharian)
+* [salmān aljammāz](https://github.com/saljam)
+* [cnderrauber](https://github.com/cnderrauber)
+* [Juliusz Chroboczek](https://github.com/jech)
+* [John Berthels](https://github.com/jbert)
+* [Somers Matthews](https://github.com/somersbmatthews)
+* [Vitaliy F](https://github.com/funvit)
+* [Ivan Egorov](https://github.com/vany-egorov)
 
 ### License
 MIT License - see [LICENSE](LICENSE) for full text
