@@ -8,7 +8,6 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"fmt"
-	mathRand "math/rand"
 	"strconv"
 	"strings"
 	"sync"
@@ -394,12 +393,16 @@ func (pc *PeerConnection) getStatsID() string {
 func (pc *PeerConnection) CreateOffer(options *OfferOptions) (SessionDescription, error) {
 	useIdentity := pc.idpLoginURL != nil
 	switch {
-	case options != nil:
-		return SessionDescription{}, fmt.Errorf("TODO handle options")
 	case useIdentity:
 		return SessionDescription{}, fmt.Errorf("TODO handle identity provider")
 	case pc.isClosed.get():
 		return SessionDescription{}, &rtcerr.InvalidStateError{Err: ErrConnectionClosed}
+	}
+
+	if options != nil && options.ICERestart {
+		if err := pc.iceTransport.restart(); err != nil {
+			return SessionDescription{}, err
+		}
 	}
 
 	isPlanB := pc.configuration.SDPSemantics == SDPSemanticsPlanB
@@ -555,8 +558,6 @@ func (pc *PeerConnection) createICETransport() *ICETransport {
 func (pc *PeerConnection) CreateAnswer(options *AnswerOptions) (SessionDescription, error) {
 	useIdentity := pc.idpLoginURL != nil
 	switch {
-	case options != nil:
-		return SessionDescription{}, fmt.Errorf("TODO handle options")
 	case pc.RemoteDescription() == nil:
 		return SessionDescription{}, &rtcerr.InvalidStateError{Err: ErrNoRemoteDescription}
 	case useIdentity:
@@ -591,8 +592,11 @@ func (pc *PeerConnection) CreateAnswer(options *AnswerOptions) (SessionDescripti
 
 // 4.4.1.6 Set the SessionDescription
 func (pc *PeerConnection) setDescription(sd *SessionDescription, op stateChangeOp) error {
-	if pc.isClosed.get() {
+	switch {
+	case pc.isClosed.get():
 		return &rtcerr.InvalidStateError{Err: ErrConnectionClosed}
+	case newSDPType(sd.Type.String()) == SDPType(Unknown):
+		return &rtcerr.TypeError{Err: fmt.Errorf("the provided value '%d' is not a valid enum value of type SDPType", sd.Type)}
 	}
 
 	nextState, err := func() (SignalingState, error) {
@@ -725,11 +729,13 @@ func (pc *PeerConnection) SetLocalDescription(desc SessionDescription) error {
 		return err
 	}
 
+	currentTransceivers := append([]*RTPTransceiver{}, pc.GetTransceivers()...)
+
 	weAnswer := desc.Type == SDPTypeAnswer
 	remoteDesc := pc.RemoteDescription()
 	if weAnswer && remoteDesc != nil {
 		pc.ops.Enqueue(func() {
-			pc.startRTP(haveLocalDescription, remoteDesc)
+			pc.startRTP(haveLocalDescription, remoteDesc, currentTransceivers)
 		})
 	}
 
@@ -751,12 +757,13 @@ func (pc *PeerConnection) LocalDescription() *SessionDescription {
 }
 
 // SetRemoteDescription sets the SessionDescription of the remote peer
+// nolint: gocyclo
 func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 	if pc.isClosed.get() {
 		return &rtcerr.InvalidStateError{Err: ErrConnectionClosed}
 	}
 
-	haveRemoteDescription := pc.currentRemoteDescription != nil
+	isRenegotation := pc.currentRemoteDescription != nil
 
 	desc.parsed = &sdp.SessionDescription{}
 	if err := desc.parsed.Unmarshal([]byte(desc.SDP)); err != nil {
@@ -766,11 +773,10 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 		return err
 	}
 
-	weOffer := desc.Type == SDPTypeAnswer
-
 	var t *RTPTransceiver
 	localTransceivers := append([]*RTPTransceiver{}, pc.GetTransceivers()...)
 	detectedPlanB := descriptionIsPlanB(pc.RemoteDescription())
+	weOffer := desc.Type == SDPTypeAnswer
 
 	if !weOffer && !detectedPlanB {
 		for _, media := range pc.RemoteDescription().parsed.MediaDescriptions {
@@ -806,10 +812,36 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 		}
 	}
 
-	if haveRemoteDescription {
+	remoteUfrag, remotePwd, candidates, err := extractICEDetails(desc.parsed)
+	if err != nil {
+		return err
+	}
+
+	if isRenegotation && pc.iceTransport.haveRemoteCredentialsChange(remoteUfrag, remotePwd) {
+		// An ICE Restart only happens implicitly for a SetRemoteDescription of type offer
+		if !weOffer {
+			if err = pc.iceTransport.restart(); err != nil {
+				return err
+			}
+		}
+
+		if err = pc.iceTransport.setRemoteCredentials(remoteUfrag, remotePwd); err != nil {
+			return err
+		}
+	}
+
+	for _, c := range candidates {
+		if err = pc.iceTransport.AddRemoteCandidate(c); err != nil {
+			return err
+		}
+	}
+
+	currentTransceivers := append([]*RTPTransceiver{}, pc.GetTransceivers()...)
+
+	if isRenegotation {
 		if weOffer {
 			pc.ops.Enqueue(func() {
-				pc.startRTP(true, &desc)
+				pc.startRTP(true, &desc, currentTransceivers)
 			})
 		}
 		return nil
@@ -825,17 +857,6 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 		return err
 	}
 
-	remoteUfrag, remotePwd, candidates, err := extractICEDetails(desc.parsed)
-	if err != nil {
-		return err
-	}
-
-	for _, c := range candidates {
-		if err = pc.iceTransport.AddRemoteCandidate(c); err != nil {
-			return err
-		}
-	}
-
 	iceRole := ICERoleControlled
 	// If one of the agents is lite and the other one is not, the lite agent must be the controlling agent.
 	// If both or neither agents are lite the offering agent is controlling.
@@ -849,7 +870,7 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 	pc.ops.Enqueue(func() {
 		pc.startTransports(iceRole, dtlsRoleFromRemoteSDP(desc.parsed), remoteUfrag, remotePwd, fingerprint, fingerprintHash)
 		if weOffer {
-			pc.startRTP(false, &desc)
+			pc.startRTP(false, &desc, currentTransceivers)
 		}
 	})
 	return nil
@@ -1253,7 +1274,7 @@ func (pc *PeerConnection) AddTransceiverFromKind(kind RTPCodecType, init ...RtpT
 			return nil, fmt.Errorf("no %s codecs found", kind.String())
 		}
 
-		track, err := pc.NewTrack(codecs[0].PayloadType, mathRand.Uint32(), util.RandSeq(trackDefaultIDLength), util.RandSeq(trackDefaultLabelLength))
+		track, err := pc.NewTrack(codecs[0].PayloadType, util.RandUint32(), util.MathRandAlpha(trackDefaultIDLength), util.MathRandAlpha(trackDefaultLabelLength))
 		if err != nil {
 			return nil, err
 		}
@@ -1663,8 +1684,7 @@ func (pc *PeerConnection) startTransports(iceRole ICERole, dtlsRole DTLSRole, re
 	}
 }
 
-func (pc *PeerConnection) startRTP(isRenegotiation bool, remoteDesc *SessionDescription) {
-	currentTransceivers := append([]*RTPTransceiver{}, pc.GetTransceivers()...)
+func (pc *PeerConnection) startRTP(isRenegotiation bool, remoteDesc *SessionDescription, currentTransceivers []*RTPTransceiver) {
 	trackDetails := trackDetailsFromSDP(pc.log, remoteDesc.parsed)
 	if isRenegotiation {
 		for _, t := range currentTransceivers {
@@ -1716,8 +1736,8 @@ func (pc *PeerConnection) GetRegisteredRTPCodecs(kind RTPCodecType) []*RTPCodec 
 // generateUnmatchedSDP generates an SDP that doesn't take remote state into account
 // This is used for the initial call for CreateOffer
 func (pc *PeerConnection) generateUnmatchedSDP(useIdentity bool) (*sdp.SessionDescription, error) {
-	d := sdp.NewJSEPSessionDescription(useIdentity)
-	if err := addFingerprints(d, pc.configuration.Certificates[0]); err != nil {
+	d, err := sdp.NewJSEPSessionDescription(useIdentity)
+	if err != nil {
 		return nil, err
 	}
 
@@ -1767,14 +1787,19 @@ func (pc *PeerConnection) generateUnmatchedSDP(useIdentity bool) (*sdp.SessionDe
 		mediaSections = append(mediaSections, mediaSection{id: strconv.Itoa(len(mediaSections)), data: true})
 	}
 
-	return populateSDP(d, isPlanB, pc.api.settingEngine.candidates.ICELite, pc.api.mediaEngine, connectionRoleFromDtlsRole(defaultDtlsRoleOffer), candidates, iceParams, mediaSections, pc.ICEGatheringState())
+	dtlsFingerprints, err := pc.configuration.Certificates[0].GetFingerprints()
+	if err != nil {
+		return nil, err
+	}
+
+	return populateSDP(d, isPlanB, dtlsFingerprints, pc.api.settingEngine.sdpMediaLevelFingerprints, pc.api.settingEngine.candidates.ICELite, pc.api.mediaEngine, connectionRoleFromDtlsRole(defaultDtlsRoleOffer), candidates, iceParams, mediaSections, pc.ICEGatheringState(), pc.api.settingEngine.getSDPExtensions())
 }
 
 // generateMatchedSDP generates a SDP and takes the remote state into account
 // this is used everytime we have a RemoteDescription
 func (pc *PeerConnection) generateMatchedSDP(useIdentity bool, includeUnmatched bool, connectionRole sdp.ConnectionRole) (*sdp.SessionDescription, error) {
-	d := sdp.NewJSEPSessionDescription(useIdentity)
-	if err := addFingerprints(d, pc.configuration.Certificates[0]); err != nil {
+	d, err := sdp.NewJSEPSessionDescription(useIdentity)
+	if err != nil {
 		return nil, err
 	}
 
@@ -1849,7 +1874,7 @@ func (pc *PeerConnection) generateMatchedSDP(useIdentity bool, includeUnmatched 
 				t.Sender().setNegotiated()
 			}
 			mediaTransceivers := []*RTPTransceiver{t}
-			mediaSections = append(mediaSections, mediaSection{id: midValue, transceivers: mediaTransceivers})
+			mediaSections = append(mediaSections, mediaSection{id: midValue, transceivers: mediaTransceivers, ridMap: getRids(media)})
 		}
 	}
 
@@ -1867,7 +1892,17 @@ func (pc *PeerConnection) generateMatchedSDP(useIdentity bool, includeUnmatched 
 		pc.log.Info("Plan-B Offer detected; responding with Plan-B Answer")
 	}
 
-	return populateSDP(d, detectedPlanB, pc.api.settingEngine.candidates.ICELite, pc.api.mediaEngine, connectionRole, candidates, iceParams, mediaSections, pc.ICEGatheringState())
+	dtlsFingerprints, err := pc.configuration.Certificates[0].GetFingerprints()
+	if err != nil {
+		return nil, err
+	}
+
+	matchedSDPMap, err := matchedAnswerExt(pc.RemoteDescription().parsed, pc.api.settingEngine.getSDPExtensions())
+	if err != nil {
+		return nil, err
+	}
+
+	return populateSDP(d, detectedPlanB, dtlsFingerprints, pc.api.settingEngine.sdpMediaLevelFingerprints, pc.api.settingEngine.candidates.ICELite, pc.api.mediaEngine, connectionRole, candidates, iceParams, mediaSections, pc.ICEGatheringState(), matchedSDPMap)
 }
 
 func (pc *PeerConnection) setGatherCompleteHdlr(hdlr func()) {

@@ -3,6 +3,7 @@
 package webrtc
 
 import (
+	"bufio"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -12,6 +13,7 @@ import (
 	"math/big"
 	"reflect"
 	"regexp"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -141,9 +143,9 @@ func TestNew_Go(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotNil(t, pc)
 
-		pc.configuration.ICEServers[0].Username = util.RandSeq(15)
-		pc.configuration.ICEServers[0].Credential = util.RandSeq(15)
-		pc.configuration.ICEServers[0].URLs[0] = util.RandSeq(15)
+		pc.configuration.ICEServers[0].Username = util.MathRandAlpha(15) // Tests doesn't need crypto random
+		pc.configuration.ICEServers[0].Credential = util.MathRandAlpha(15)
+		pc.configuration.ICEServers[0].URLs[0] = util.MathRandAlpha(15)
 
 		assert.Equal(t, expectedUsername, cfg.ICEServers[0].Username)
 		assert.Equal(t, expectedPassword, cfg.ICEServers[0].Credential)
@@ -767,7 +769,10 @@ func TestPopulateLocalCandidates(t *testing.T) {
 		offer, err := pc.CreateOffer(nil)
 		assert.NoError(t, err)
 
+		offerGatheringComplete := GatheringCompletePromise(pc)
 		assert.NoError(t, pc.SetLocalDescription(offer))
+		<-offerGatheringComplete
+
 		assert.Equal(t, pc.PendingLocalDescription(), pc.PendingLocalDescription())
 		assert.NoError(t, pc.Close())
 	})
@@ -776,23 +781,94 @@ func TestPopulateLocalCandidates(t *testing.T) {
 		pc, err := NewAPI().NewPeerConnection(Configuration{})
 		assert.NoError(t, err)
 
-		gatherComplete, gatherCompleteCancel := context.WithCancel(context.Background())
-		pc.OnICEGatheringStateChange(func(i ICEGathererState) {
-			if i == ICEGathererStateComplete {
-				gatherCompleteCancel()
-			}
-		})
-
 		offer, err := pc.CreateOffer(nil)
 		assert.NoError(t, err)
 		assert.NotContains(t, offer.SDP, "a=candidate")
 		assert.NotContains(t, offer.SDP, "a=end-of-candidates")
 
+		offerGatheringComplete := GatheringCompletePromise(pc)
 		assert.NoError(t, pc.SetLocalDescription(offer))
-		<-gatherComplete.Done()
+		<-offerGatheringComplete
+
 		assert.Contains(t, pc.PendingLocalDescription().SDP, "a=candidate")
 		assert.Contains(t, pc.PendingLocalDescription().SDP, "a=end-of-candidates")
 
 		assert.NoError(t, pc.Close())
 	})
+}
+
+func TestICERestart(t *testing.T) {
+	extractCandidates := func(sdp string) (candidates []string) {
+		sc := bufio.NewScanner(strings.NewReader(sdp))
+		for sc.Scan() {
+			if strings.HasPrefix(sc.Text(), "a=candidate:") {
+				candidates = append(candidates, sc.Text())
+			}
+		}
+
+		return
+	}
+
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	offerPC, answerPC, err := newPair()
+	assert.NoError(t, err)
+
+	var connectedWaitGroup sync.WaitGroup
+	connectedWaitGroup.Add(2)
+
+	offerPC.OnICEConnectionStateChange(func(state ICEConnectionState) {
+		if state == ICEConnectionStateConnected {
+			connectedWaitGroup.Done()
+		}
+	})
+	answerPC.OnICEConnectionStateChange(func(state ICEConnectionState) {
+		if state == ICEConnectionStateConnected {
+			connectedWaitGroup.Done()
+		}
+	})
+
+	// Connect two PeerConnections and block until ICEConnectionStateConnected
+	assert.NoError(t, signalPair(offerPC, answerPC))
+	connectedWaitGroup.Wait()
+
+	// Store candidates from first Offer/Answer, compare later to make sure we re-gathered
+	firstOfferCandidates := extractCandidates(offerPC.LocalDescription().SDP)
+	firstAnswerCandidates := extractCandidates(answerPC.LocalDescription().SDP)
+
+	// Re-signal with ICE Restart, block until ICEConnectionStateConnected
+	connectedWaitGroup.Add(2)
+	offer, err := offerPC.CreateOffer(&OfferOptions{ICERestart: true})
+	assert.NoError(t, err)
+
+	// Block until Gathering is Complete
+	offerGatheringComplete := GatheringCompletePromise(offerPC)
+	assert.NoError(t, offerPC.SetLocalDescription(offer))
+	<-offerGatheringComplete
+
+	assert.NoError(t, answerPC.SetRemoteDescription(*offerPC.LocalDescription()))
+
+	answer, err := answerPC.CreateAnswer(nil)
+	assert.NoError(t, err)
+
+	// Block until Gathering is Complete
+	answerGatheringComplete := GatheringCompletePromise(answerPC)
+	assert.NoError(t, answerPC.SetLocalDescription(answer))
+	<-answerGatheringComplete
+
+	assert.NoError(t, offerPC.SetRemoteDescription(*answerPC.LocalDescription()))
+
+	// Block until we have connected again
+	connectedWaitGroup.Wait()
+
+	// Compare ICE Candidates across each run, fail if they haven't changed
+	assert.NotEqual(t, firstOfferCandidates, extractCandidates(offerPC.LocalDescription().SDP))
+	assert.NotEqual(t, firstAnswerCandidates, extractCandidates(answerPC.LocalDescription().SDP))
+
+	assert.NoError(t, offerPC.Close())
+	assert.NoError(t, answerPC.Close())
 }

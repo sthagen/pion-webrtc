@@ -3,6 +3,11 @@
 package webrtc
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/pion/sdp/v2"
@@ -194,6 +199,15 @@ func TestTrackDetailsFromSDP(t *testing.T) {
 						{Key: "ssrc", Value: "5000"},
 					},
 				},
+				{
+					MediaName: sdp.MediaName{
+						Media: "video",
+					},
+					Attributes: []sdp.Attribute{
+						{Key: "sendonly"},
+						{Key: "rid", Value: "f send pt=97;max-width=1280;max-height=720"},
+					},
+				},
 			},
 		}
 
@@ -252,7 +266,6 @@ func TestTrackDetailsFromSDP(t *testing.T) {
 				},
 			},
 		}
-
 		assert.Equal(t, 0, len(trackDetailsFromSDP(nil, s)))
 	})
 }
@@ -289,4 +302,232 @@ func TestHaveApplicationMediaSection(t *testing.T) {
 
 		assert.True(t, haveApplicationMediaSection(s))
 	})
+}
+
+func TestMediaDescriptionFingerprints(t *testing.T) {
+	engine := &MediaEngine{}
+	engine.RegisterCodec(NewRTPH264Codec(DefaultPayloadTypeH264, 90000))
+	engine.RegisterCodec(NewRTPOpusCodec(DefaultPayloadTypeOpus, 48000))
+
+	sk, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	assert.NoError(t, err)
+
+	certificate, err := GenerateCertificate(sk)
+	assert.NoError(t, err)
+
+	media := []mediaSection{
+		{
+			id: "video",
+			transceivers: []*RTPTransceiver{{
+				kind: RTPCodecTypeVideo,
+			}},
+		},
+		{
+			id: "audio",
+			transceivers: []*RTPTransceiver{{
+				kind: RTPCodecTypeAudio,
+			}},
+		},
+		{
+			id:   "application",
+			data: true,
+		},
+	}
+
+	for i := 0; i < 2; i++ {
+		media[i].transceivers[0].setSender(&RTPSender{})
+		media[i].transceivers[0].setDirection(RTPTransceiverDirectionSendonly)
+	}
+
+	fingerprintTest := func(SDPMediaDescriptionFingerprints bool, expectedFingerprintCount int) func(t *testing.T) {
+		return func(t *testing.T) {
+			s := &sdp.SessionDescription{}
+
+			dtlsFingerprints, err := certificate.GetFingerprints()
+			assert.NoError(t, err)
+
+			s, err = populateSDP(s, false,
+				dtlsFingerprints,
+				SDPMediaDescriptionFingerprints,
+				false, engine, sdp.ConnectionRoleActive, []ICECandidate{}, ICEParameters{}, media, ICEGatheringStateNew, nil)
+			assert.NoError(t, err)
+
+			sdparray, err := s.Marshal()
+			assert.NoError(t, err)
+
+			assert.Equal(t, strings.Count(string(sdparray), "sha-256"), expectedFingerprintCount)
+		}
+	}
+
+	t.Run("Per-Media Description Fingerprints", fingerprintTest(true, 3))
+	t.Run("Per-Session Description Fingerprints", fingerprintTest(false, 1))
+}
+
+func TestPopulateSDP(t *testing.T) {
+	t.Run("Extensions", func(t *testing.T) {
+		transportCCURL, _ := url.Parse(sdp.TransportCCURI)
+		absSendURL, _ := url.Parse(sdp.ABSSendTimeURI)
+
+		globalExts := []sdp.ExtMap{
+			{
+				URI: transportCCURL,
+			},
+		}
+		videoExts := []sdp.ExtMap{
+			{
+				URI: absSendURL,
+			},
+		}
+		tr := &RTPTransceiver{kind: RTPCodecTypeVideo}
+		tr.setDirection(RTPTransceiverDirectionSendrecv)
+		mediaSections := []mediaSection{{id: "video", transceivers: []*RTPTransceiver{tr}}}
+
+		se := SettingEngine{}
+		se.AddSDPExtensions(SDPSectionGlobal, globalExts)
+		se.AddSDPExtensions(SDPSectionVideo, videoExts)
+
+		m := MediaEngine{}
+		m.RegisterDefaultCodecs()
+
+		d := &sdp.SessionDescription{}
+
+		offerSdp, err := populateSDP(d, false, []DTLSFingerprint{}, se.sdpMediaLevelFingerprints, se.candidates.ICELite, &m, connectionRoleFromDtlsRole(defaultDtlsRoleOffer), []ICECandidate{}, ICEParameters{}, mediaSections, ICEGatheringStateComplete, se.getSDPExtensions())
+		assert.Nil(t, err)
+
+		// Check global extensions
+		var found bool
+		for _, a := range offerSdp.Attributes {
+			if strings.Contains(a.Key, transportCCURL.String()) {
+				found = true
+				break
+			}
+		}
+		assert.Equal(t, true, found, "Global extension should be present")
+
+		// Check video extension
+		found = false
+		var foundGlobal bool
+		for _, desc := range offerSdp.MediaDescriptions {
+			if desc.MediaName.Media != mediaNameVideo {
+				continue
+			}
+			for _, a := range desc.Attributes {
+				if strings.Contains(a.Key, absSendURL.String()) {
+					found = true
+				}
+				if strings.Contains(a.Key, transportCCURL.String()) {
+					foundGlobal = true
+				}
+			}
+		}
+		assert.Equal(t, true, found, "Video extension should be present")
+		// Test video does not contain global
+		assert.Equal(t, false, foundGlobal, "Global extension should not be present in video section")
+	})
+
+	t.Run("Rid", func(t *testing.T) {
+		tr := &RTPTransceiver{kind: RTPCodecTypeVideo}
+		tr.setDirection(RTPTransceiverDirectionRecvonly)
+		ridMap := map[string]string{
+			"ridkey": "some",
+		}
+		mediaSections := []mediaSection{{id: "video", transceivers: []*RTPTransceiver{tr}, ridMap: ridMap}}
+
+		se := SettingEngine{}
+
+		m := MediaEngine{}
+		m.RegisterDefaultCodecs()
+
+		d := &sdp.SessionDescription{}
+
+		offerSdp, err := populateSDP(d, false, []DTLSFingerprint{}, se.sdpMediaLevelFingerprints, se.candidates.ICELite, &m, connectionRoleFromDtlsRole(defaultDtlsRoleOffer), []ICECandidate{}, ICEParameters{}, mediaSections, ICEGatheringStateComplete, se.getSDPExtensions())
+		assert.Nil(t, err)
+
+		// Test contains rid map keys
+		var found bool
+		for _, desc := range offerSdp.MediaDescriptions {
+			if desc.MediaName.Media != mediaNameVideo {
+				continue
+			}
+			for _, a := range desc.Attributes {
+				if a.Key == "rid" {
+					if strings.Contains(a.Value, "ridkey") {
+						found = true
+						break
+					}
+				}
+			}
+		}
+		assert.Equal(t, true, found, "Rid key should be present")
+	})
+}
+
+func TestMatchedAnswerExt(t *testing.T) {
+	s := &sdp.SessionDescription{
+		MediaDescriptions: []*sdp.MediaDescription{
+			{
+				MediaName: sdp.MediaName{
+					Media: "video",
+				},
+				Attributes: []sdp.Attribute{
+					{Key: "sendrecv"},
+					{Key: "ssrc", Value: "2000"},
+					{Key: "extmap", Value: "5 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"},
+				},
+			},
+		},
+	}
+
+	transportCCURL, _ := url.Parse(sdp.TransportCCURI)
+	absSendURL, _ := url.Parse(sdp.ABSSendTimeURI)
+
+	exts := []sdp.ExtMap{
+		{
+			URI: transportCCURL,
+		},
+		{
+			URI: absSendURL,
+		},
+	}
+
+	se := SettingEngine{}
+	se.AddSDPExtensions(SDPSectionVideo, exts)
+
+	ansMaps, err := matchedAnswerExt(s, se.getSDPExtensions())
+	if err != nil {
+		t.Fatalf("Ext parse error %v", err)
+	}
+
+	if maps := ansMaps[SDPSectionVideo]; maps != nil {
+		// Check answer contains intersect of remote and local
+		// Abs send time should be only extenstion
+		assert.Equal(t, 1, len(maps), "Only one extension should be active")
+		assert.Equal(t, absSendURL, maps[0].URI, "Only abs-send-time should be active")
+
+		// Check answer uses remote IDs
+		assert.Equal(t, 5, maps[0].Value, "Should use remote ext ID")
+	} else {
+		t.Fatal("No video ext maps found")
+	}
+}
+
+func TestGetRIDs(t *testing.T) {
+	m := []*sdp.MediaDescription{
+		{
+			MediaName: sdp.MediaName{
+				Media: "video",
+			},
+			Attributes: []sdp.Attribute{
+				{Key: "sendonly"},
+				{Key: "rid", Value: "f send pt=97;max-width=1280;max-height=720"},
+			},
+		},
+	}
+
+	rids := getRids(m[0])
+
+	assert.NotEmpty(t, rids, "Rid mapping should be present")
+	if _, ok := rids["f"]; !ok {
+		assert.Fail(t, "rid values should contain 'f'")
+	}
 }

@@ -88,28 +88,28 @@ func (g *ICEGatherer) createAgent() error {
 	}
 
 	config := &ice.AgentConfig{
-		Lite:                      g.api.settingEngine.candidates.ICELite,
-		Urls:                      g.validatedServers,
-		PortMin:                   g.api.settingEngine.ephemeralUDP.PortMin,
-		PortMax:                   g.api.settingEngine.ephemeralUDP.PortMax,
-		DisconnectedTimeout:       g.api.settingEngine.timeout.ICEDisconnectedTimeout,
-		FailedTimeout:             g.api.settingEngine.timeout.ICEFailedTimeout,
-		KeepaliveInterval:         g.api.settingEngine.timeout.ICEKeepaliveInterval,
-		LoggerFactory:             g.api.settingEngine.LoggerFactory,
-		CandidateTypes:            candidateTypes,
-		CandidateSelectionTimeout: g.api.settingEngine.timeout.ICECandidateSelectionTimeout,
-		HostAcceptanceMinWait:     g.api.settingEngine.timeout.ICEHostAcceptanceMinWait,
-		SrflxAcceptanceMinWait:    g.api.settingEngine.timeout.ICESrflxAcceptanceMinWait,
-		PrflxAcceptanceMinWait:    g.api.settingEngine.timeout.ICEPrflxAcceptanceMinWait,
-		RelayAcceptanceMinWait:    g.api.settingEngine.timeout.ICERelayAcceptanceMinWait,
-		InterfaceFilter:           g.api.settingEngine.candidates.InterfaceFilter,
-		NAT1To1IPs:                g.api.settingEngine.candidates.NAT1To1IPs,
-		NAT1To1IPCandidateType:    nat1To1CandiTyp,
-		Net:                       g.api.settingEngine.vnet,
-		MulticastDNSMode:          multicastDNSMode,
-		MulticastDNSHostName:      g.api.settingEngine.candidates.MulticastDNSHostName,
-		LocalUfrag:                g.api.settingEngine.candidates.UsernameFragment,
-		LocalPwd:                  g.api.settingEngine.candidates.Password,
+		Lite:                   g.api.settingEngine.candidates.ICELite,
+		Urls:                   g.validatedServers,
+		PortMin:                g.api.settingEngine.ephemeralUDP.PortMin,
+		PortMax:                g.api.settingEngine.ephemeralUDP.PortMax,
+		DisconnectedTimeout:    g.api.settingEngine.timeout.ICEDisconnectedTimeout,
+		FailedTimeout:          g.api.settingEngine.timeout.ICEFailedTimeout,
+		KeepaliveInterval:      g.api.settingEngine.timeout.ICEKeepaliveInterval,
+		LoggerFactory:          g.api.settingEngine.LoggerFactory,
+		CandidateTypes:         candidateTypes,
+		HostAcceptanceMinWait:  g.api.settingEngine.timeout.ICEHostAcceptanceMinWait,
+		SrflxAcceptanceMinWait: g.api.settingEngine.timeout.ICESrflxAcceptanceMinWait,
+		PrflxAcceptanceMinWait: g.api.settingEngine.timeout.ICEPrflxAcceptanceMinWait,
+		RelayAcceptanceMinWait: g.api.settingEngine.timeout.ICERelayAcceptanceMinWait,
+		InterfaceFilter:        g.api.settingEngine.candidates.InterfaceFilter,
+		NAT1To1IPs:             g.api.settingEngine.candidates.NAT1To1IPs,
+		NAT1To1IPCandidateType: nat1To1CandiTyp,
+		Net:                    g.api.settingEngine.vnet,
+		MulticastDNSMode:       multicastDNSMode,
+		MulticastDNSHostName:   g.api.settingEngine.candidates.MulticastDNSHostName,
+		LocalUfrag:             g.api.settingEngine.candidates.UsernameFragment,
+		LocalPwd:               g.api.settingEngine.candidates.Password,
+		TCPListenPort:          g.api.settingEngine.iceTCPPort,
 	}
 
 	requestedNetworkTypes := g.api.settingEngine.candidates.ICENetworkTypes
@@ -136,22 +136,22 @@ func (g *ICEGatherer) Gather() error {
 		return err
 	}
 
-	onLocalCandidateHdlr := func(*ICECandidate) {}
-	if hdlr, ok := g.onLocalCandidateHdlr.Load().(func(candidate *ICECandidate)); ok && hdlr != nil {
-		onLocalCandidateHdlr = hdlr
-	}
-
-	onGatheringCompleteHdlr := func() {}
-	if hdlr, ok := g.onGatheringCompleteHdlr.Load().(func()); ok && hdlr != nil {
-		onGatheringCompleteHdlr = hdlr
-	}
-
 	g.lock.Lock()
 	agent := g.agent
 	g.lock.Unlock()
 
 	g.setState(ICEGathererStateGathering)
 	if err := agent.OnCandidate(func(candidate ice.Candidate) {
+		onLocalCandidateHdlr := func(*ICECandidate) {}
+		if hdlr, ok := g.onLocalCandidateHdlr.Load().(func(candidate *ICECandidate)); ok && hdlr != nil {
+			onLocalCandidateHdlr = hdlr
+		}
+
+		onGatheringCompleteHdlr := func() {}
+		if hdlr, ok := g.onGatheringCompleteHdlr.Load().(func()); ok && hdlr != nil {
+			onGatheringCompleteHdlr = hdlr
+		}
+
 		if candidate != nil {
 			c, err := newICECandidateFromICE(candidate)
 			if err != nil {
@@ -194,7 +194,11 @@ func (g *ICEGatherer) GetLocalParameters() (ICEParameters, error) {
 		return ICEParameters{}, err
 	}
 
-	frag, pwd := g.agent.GetLocalUserCredentials()
+	frag, pwd, err := g.agent.GetLocalUserCredentials()
+	if err != nil {
+		return ICEParameters{}, err
+	}
+
 	return ICEParameters{
 		UsernameFragment: frag,
 		Password:         pwd,
