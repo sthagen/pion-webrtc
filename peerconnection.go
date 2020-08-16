@@ -77,7 +77,7 @@ type PeerConnection struct {
 }
 
 // NewPeerConnection creates a peerconnection with the default
-// codecs. See API.NewRTCPeerConnection for details.
+// codecs. See API.NewPeerConnection for details.
 func NewPeerConnection(configuration Configuration) (*PeerConnection, error) {
 	m := MediaEngine{}
 	m.RegisterDefaultCodecs()
@@ -1249,7 +1249,7 @@ func (pc *PeerConnection) GetSenders() []*RTPSender {
 	return result
 }
 
-// GetReceivers returns the RTPReceivers that are currently attached to this RTCPeerConnection
+// GetReceivers returns the RTPReceivers that are currently attached to this PeerConnection
 func (pc *PeerConnection) GetReceivers() []*RTPReceiver {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
@@ -1263,7 +1263,7 @@ func (pc *PeerConnection) GetReceivers() []*RTPReceiver {
 	return result
 }
 
-// GetTransceivers returns the RTCRtpTransceiver that are currently attached to this RTCPeerConnection
+// GetTransceivers returns the RtpTransceiver that are currently attached to this PeerConnection
 func (pc *PeerConnection) GetTransceivers() []*RTPTransceiver {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
@@ -1305,7 +1305,7 @@ func (pc *PeerConnection) AddTrack(track *Track) (*RTPSender, error) {
 	return transceiver.Sender(), nil
 }
 
-// AddTransceiver Create a new RTCRtpTransceiver and add it to the set of transceivers.
+// AddTransceiver Create a new RtpTransceiver and add it to the set of transceivers.
 // Deprecated: Use AddTrack, AddTransceiverFromKind or AddTransceiverFromTrack
 func (pc *PeerConnection) AddTransceiver(trackOrKind RTPCodecType, init ...RtpTransceiverInit) (*RTPTransceiver, error) {
 	return pc.AddTransceiverFromKind(trackOrKind, init...)
@@ -1334,7 +1334,7 @@ func (pc *PeerConnection) RemoveTrack(sender *RTPSender) error {
 	return transceiver.setSendingTrack(nil)
 }
 
-// AddTransceiverFromKind Create a new RTCRtpTransceiver(SendRecv or RecvOnly) and add it to the set of transceivers.
+// AddTransceiverFromKind Create a new RtpTransceiver(SendRecv or RecvOnly) and add it to the set of transceivers.
 func (pc *PeerConnection) AddTransceiverFromKind(kind RTPCodecType, init ...RtpTransceiverInit) (*RTPTransceiver, error) {
 	if pc.isClosed.get() {
 		return nil, &rtcerr.InvalidStateError{Err: ErrConnectionClosed}
@@ -1378,7 +1378,7 @@ func (pc *PeerConnection) AddTransceiverFromKind(kind RTPCodecType, init ...RtpT
 	}
 }
 
-// AddTransceiverFromTrack Creates a new send only transceiver and add it to the set of
+// AddTransceiverFromTrack Create a new RtpTransceiver(SendRecv or SendOnly) and add it to the set of transceivers.
 func (pc *PeerConnection) AddTransceiverFromTrack(track *Track, init ...RtpTransceiverInit) (*RTPTransceiver, error) {
 	if pc.isClosed.get() {
 		return nil, &rtcerr.InvalidStateError{Err: ErrConnectionClosed}
@@ -1800,12 +1800,12 @@ func (pc *PeerConnection) startRTP(isRenegotiation bool, remoteDesc *SessionDesc
 
 	pc.startRTPReceivers(trackDetails, currentTransceivers)
 	pc.startRTPSenders(currentTransceivers)
+	if haveApplicationMediaSection(remoteDesc.parsed) {
+		pc.startSCTP()
+	}
 
 	if !isRenegotiation {
 		pc.undeclaredMediaProcessor()
-		if haveApplicationMediaSection(remoteDesc.parsed) {
-			pc.startSCTP()
-		}
 	}
 }
 
@@ -1856,8 +1856,9 @@ func (pc *PeerConnection) generateUnmatchedSDP(useIdentity bool) (*sdp.SessionDe
 		if len(audio) > 0 {
 			mediaSections = append(mediaSections, mediaSection{id: "audio", transceivers: audio})
 		}
-		for i := uint32(0); i < pc.sctpTransport.dataChannelsRequested; i++ {
-			mediaSections = append(mediaSections, mediaSection{id: pc.sctpTransport.dataChannels[i].label, data: true})
+
+		if pc.sctpTransport.dataChannelsRequested != 0 {
+			mediaSections = append(mediaSections, mediaSection{id: "data", data: true})
 		}
 	} else {
 		for _, t := range pc.GetTransceivers() {
@@ -1867,7 +1868,7 @@ func (pc *PeerConnection) generateUnmatchedSDP(useIdentity bool) (*sdp.SessionDe
 			mediaSections = append(mediaSections, mediaSection{id: t.Mid(), transceivers: []*RTPTransceiver{t}})
 		}
 
-		for i := uint32(0); i < pc.sctpTransport.dataChannelsRequested; i++ {
+		if pc.sctpTransport.dataChannelsRequested != 0 {
 			mediaSections = append(mediaSections, mediaSection{id: strconv.Itoa(len(mediaSections)), data: true})
 		}
 	}
@@ -1882,6 +1883,7 @@ func (pc *PeerConnection) generateUnmatchedSDP(useIdentity bool) (*sdp.SessionDe
 
 // generateMatchedSDP generates a SDP and takes the remote state into account
 // this is used everytime we have a RemoteDescription
+// nolint: gocyclo
 func (pc *PeerConnection) generateMatchedSDP(useIdentity bool, includeUnmatched bool, connectionRole sdp.ConnectionRole) (*sdp.SessionDescription, error) {
 	d, err := sdp.NewJSEPSessionDescription(useIdentity)
 	if err != nil {
@@ -1902,6 +1904,7 @@ func (pc *PeerConnection) generateMatchedSDP(useIdentity bool, includeUnmatched 
 	localTransceivers := append([]*RTPTransceiver{}, pc.GetTransceivers()...)
 	detectedPlanB := descriptionIsPlanB(pc.RemoteDescription())
 	mediaSections := []mediaSection{}
+	alreadyHaveApplicationMediaSection := false
 
 	for _, media := range pc.RemoteDescription().parsed.MediaDescriptions {
 		midValue := getMidValue(media)
@@ -1911,6 +1914,7 @@ func (pc *PeerConnection) generateMatchedSDP(useIdentity bool, includeUnmatched 
 
 		if media.MediaName.Media == mediaSectionApplication {
 			mediaSections = append(mediaSections, mediaSection{id: midValue, data: true})
+			alreadyHaveApplicationMediaSection = true
 			continue
 		}
 
@@ -1964,12 +1968,22 @@ func (pc *PeerConnection) generateMatchedSDP(useIdentity bool, includeUnmatched 
 	}
 
 	// If we are offering also include unmatched local transceivers
-	if !detectedPlanB && includeUnmatched {
-		for _, t := range localTransceivers {
-			if t.Sender() != nil {
-				t.Sender().setNegotiated()
+	if includeUnmatched {
+		if !detectedPlanB {
+			for _, t := range localTransceivers {
+				if t.Sender() != nil {
+					t.Sender().setNegotiated()
+				}
+				mediaSections = append(mediaSections, mediaSection{id: t.Mid(), transceivers: []*RTPTransceiver{t}})
 			}
-			mediaSections = append(mediaSections, mediaSection{id: t.Mid(), transceivers: []*RTPTransceiver{t}})
+		}
+
+		if pc.sctpTransport.dataChannelsRequested != 0 && !alreadyHaveApplicationMediaSection {
+			if detectedPlanB {
+				mediaSections = append(mediaSections, mediaSection{id: "data", data: true})
+			} else {
+				mediaSections = append(mediaSections, mediaSection{id: strconv.Itoa(len(mediaSections)), data: true})
+			}
 		}
 	}
 
