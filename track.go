@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/pion/rtp"
+	"github.com/pion/webrtc/v3/internal/util"
 	"github.com/pion/webrtc/v3/pkg/media"
 )
 
@@ -79,6 +80,11 @@ func (t *Track) SSRC() uint32 {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.ssrc
+}
+
+// Msid gets the Msid of the track
+func (t *Track) Msid() string {
+	return t.Label() + " " + t.ID()
 }
 
 // Codec gets the Codec of the track
@@ -168,14 +174,14 @@ func (t *Track) WriteRTP(p *rtp.Packet) error {
 		return io.ErrClosedPipe
 	}
 
+	writeErrs := []error{}
 	for _, s := range senders {
-		_, err := s.SendRTP(&p.Header, p.Payload)
-		if err != nil {
-			return err
+		if _, err := s.SendRTP(&p.Header, p.Payload); err != nil {
+			writeErrs = append(writeErrs, err)
 		}
 	}
 
-	return nil
+	return util.FlattenErrs(writeErrs)
 }
 
 // NewTrack initializes a new *Track
