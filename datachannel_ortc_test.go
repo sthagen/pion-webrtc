@@ -3,11 +3,13 @@
 package webrtc
 
 import (
+	"io"
 	"testing"
 	"time"
 
 	"github.com/pion/transport/test"
 	"github.com/pion/webrtc/v3/internal/util"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestDataChannel_ORTCE2E(t *testing.T) {
@@ -75,6 +77,19 @@ func TestDataChannel_ORTCE2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	// attempt to send when channel is closed
+	err = channelA.Send([]byte("ABC"))
+	assert.Error(t, err)
+	assert.Equal(t, io.ErrClosedPipe, err)
+
+	err = channelA.SendText("test")
+	assert.Error(t, err)
+	assert.Equal(t, io.ErrClosedPipe, err)
+
+	err = channelA.ensureOpen()
+	assert.Error(t, err)
+	assert.Equal(t, io.ErrClosedPipe, err)
 }
 
 type testORTCStack struct {

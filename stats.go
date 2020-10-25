@@ -153,7 +153,7 @@ type CodecStats struct {
 	ID string `json:"id"`
 
 	// PayloadType as used in RTP encoding or decoding
-	PayloadType uint32 `json:"payloadType"`
+	PayloadType uint8 `json:"payloadType"`
 
 	// CodecType of this CodecStats
 	CodecType CodecType `json:"codecType"`
@@ -169,7 +169,7 @@ type CodecStats struct {
 	ClockRate uint32 `json:"clockRate"`
 
 	// Channels is 2 for stereo, missing for most other cases.
-	Channels uint32 `json:"channels"`
+	Channels uint8 `json:"channels"`
 
 	// SDPFmtpLine is the a=fmtp line in the SDP corresponding to the codec,
 	// i.e., after the colon following the PT.
@@ -1192,9 +1192,7 @@ func toStatsICECandidatePairState(state ice.CandidatePairState) (StatsICECandida
 		return StatsICECandidatePairStateSucceeded, nil
 	default:
 		// NOTE: this should never happen[tm]
-		err := fmt.Errorf(
-			"cannot convert to StatsICECandidatePairStateSucceeded invalid ice candidate state: %s",
-			state.String())
+		err := fmt.Errorf("%w: %s", errStatsICECandidateStateInvalid, state.String())
 		return StatsICECandidatePairState("Unknown"), err
 	}
 }

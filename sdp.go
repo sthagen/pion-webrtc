@@ -8,8 +8,9 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/pion/ice/v2"
 	"github.com/pion/logging"
-	"github.com/pion/sdp/v2"
+	"github.com/pion/sdp/v3"
 )
 
 // trackDetails represents any media source that can be represented in a SDP
@@ -53,7 +54,7 @@ const (
 )
 
 // extract all trackDetails from an SDP.
-func trackDetailsFromSDP(log logging.LeveledLogger, s *sdp.SessionDescription) []trackDetails {
+func trackDetailsFromSDP(log logging.LeveledLogger, s *sdp.SessionDescription) []trackDetails { // nolint:gocognit
 	incomingTracks := []trackDetails{}
 	rtxRepairFlows := map[uint32]bool{}
 
@@ -181,8 +182,8 @@ func getRids(media *sdp.MediaDescription) map[string]string {
 	return rids
 }
 
-func addCandidatesToMediaDescriptions(candidates []ICECandidate, m *sdp.MediaDescription, iceGatheringState ICEGatheringState) {
-	appendCandidateIfNew := func(c sdp.ICECandidate, attributes []sdp.Attribute) {
+func addCandidatesToMediaDescriptions(candidates []ICECandidate, m *sdp.MediaDescription, iceGatheringState ICEGatheringState) error {
+	appendCandidateIfNew := func(c ice.Candidate, attributes []sdp.Attribute) {
 		marshaled := c.Marshal()
 		for _, a := range attributes {
 			if marshaled == a.Value {
@@ -190,32 +191,36 @@ func addCandidatesToMediaDescriptions(candidates []ICECandidate, m *sdp.MediaDes
 			}
 		}
 
-		m.WithICECandidate(c)
+		m.WithValueAttribute("candidate", marshaled)
 	}
 
 	for _, c := range candidates {
-		sdpCandidate := iceCandidateToSDP(c)
-		sdpCandidate.ExtensionAttributes = append(sdpCandidate.ExtensionAttributes, sdp.ICECandidateAttribute{Key: "generation", Value: "0"})
-		sdpCandidate.Component = 1
-		appendCandidateIfNew(sdpCandidate, m.Attributes)
+		candidate, err := c.toICE()
+		if err != nil {
+			return err
+		}
 
-		sdpCandidate.Component = 2
-		appendCandidateIfNew(sdpCandidate, m.Attributes)
+		candidate.SetComponent(1)
+		appendCandidateIfNew(candidate, m.Attributes)
+
+		candidate.SetComponent(2)
+		appendCandidateIfNew(candidate, m.Attributes)
 	}
 
 	if iceGatheringState != ICEGatheringStateComplete {
-		return
+		return nil
 	}
 	for _, a := range m.Attributes {
 		if a.Key == "end-of-candidates" {
-			return
+			return nil
 		}
 	}
 
 	m.WithPropertyAttribute("end-of-candidates")
+	return nil
 }
 
-func addDataMediaSection(d *sdp.SessionDescription, dtlsFingerprints []DTLSFingerprint, midValue string, iceParams ICEParameters, candidates []ICECandidate, dtlsRole sdp.ConnectionRole, iceGatheringState ICEGatheringState) {
+func addDataMediaSection(d *sdp.SessionDescription, dtlsFingerprints []DTLSFingerprint, midValue string, iceParams ICEParameters, candidates []ICECandidate, dtlsRole sdp.ConnectionRole, iceGatheringState ICEGatheringState) error {
 	media := (&sdp.MediaDescription{
 		MediaName: sdp.MediaName{
 			Media:   mediaSectionApplication,
@@ -241,8 +246,12 @@ func addDataMediaSection(d *sdp.SessionDescription, dtlsFingerprints []DTLSFinge
 		media = media.WithFingerprint(f.Algorithm, strings.ToUpper(f.Value))
 	}
 
-	addCandidatesToMediaDescriptions(candidates, media, iceGatheringState)
+	if err := addCandidatesToMediaDescriptions(candidates, media, iceGatheringState); err != nil {
+		return err
+	}
+
 	d.WithMedia(media)
+	return nil
 }
 
 func populateLocalCandidates(sessionDescription *SessionDescription, i *ICEGatherer, iceGatheringState ICEGatheringState) *SessionDescription {
@@ -257,8 +266,11 @@ func populateLocalCandidates(sessionDescription *SessionDescription, i *ICEGathe
 
 	parsed := sessionDescription.parsed
 	for _, m := range parsed.MediaDescriptions {
-		addCandidatesToMediaDescriptions(candidates, m, iceGatheringState)
+		if err = addCandidatesToMediaDescriptions(candidates, m, iceGatheringState); err != nil {
+			return sessionDescription
+		}
 	}
+
 	sdp, err := parsed.Marshal()
 	if err != nil {
 		return sessionDescription
@@ -273,7 +285,7 @@ func populateLocalCandidates(sessionDescription *SessionDescription, i *ICEGathe
 func addTransceiverSDP(d *sdp.SessionDescription, isPlanB bool, dtlsFingerprints []DTLSFingerprint, mediaEngine *MediaEngine, midValue string, iceParams ICEParameters, candidates []ICECandidate, dtlsRole sdp.ConnectionRole, iceGatheringState ICEGatheringState, extMaps map[SDPSectionType][]sdp.ExtMap, mediaSection mediaSection) (bool, error) {
 	transceivers := mediaSection.transceivers
 	if len(transceivers) < 1 {
-		return false, fmt.Errorf("addTransceiverSDP() called with 0 transceivers")
+		return false, errSDPZeroTransceivers
 	}
 	// Use the first transceiver to generate the section attributes
 	t := transceivers[0]
@@ -324,8 +336,8 @@ func addTransceiverSDP(d *sdp.SessionDescription, isPlanB bool, dtlsFingerprints
 	}
 
 	for _, mt := range transceivers {
-		if mt.Sender() != nil && mt.Sender().track != nil {
-			track := mt.Sender().track
+		if mt.Sender() != nil && mt.Sender().Track() != nil {
+			track := mt.Sender().Track()
 			media = media.WithMediaSource(track.SSRC(), track.Label() /* cname */, track.Label() /* streamLabel */, track.ID())
 			if !isPlanB {
 				media = media.WithPropertyAttribute("msid:" + track.Label() + " " + track.ID())
@@ -340,7 +352,9 @@ func addTransceiverSDP(d *sdp.SessionDescription, isPlanB bool, dtlsFingerprints
 		media = media.WithFingerprint(fingerprint.Algorithm, strings.ToUpper(fingerprint.Value))
 	}
 
-	addCandidatesToMediaDescriptions(candidates, media, iceGatheringState)
+	if err := addCandidatesToMediaDescriptions(candidates, media, iceGatheringState); err != nil {
+		return false, err
+	}
 	d.WithMedia(media)
 
 	return true, nil
@@ -371,14 +385,16 @@ func populateSDP(d *sdp.SessionDescription, isPlanB bool, dtlsFingerprints []DTL
 
 	for _, m := range mediaSections {
 		if m.data && len(m.transceivers) != 0 {
-			return nil, fmt.Errorf("invalid Media Section. Media + DataChannel both enabled")
+			return nil, errSDPMediaSectionMediaDataChanInvalid
 		} else if !isPlanB && len(m.transceivers) > 1 {
-			return nil, fmt.Errorf("invalid Media Section. Can not have multiple tracks in one MediaSection in UnifiedPlan")
+			return nil, errSDPMediaSectionMultipleTrackInvalid
 		}
 
 		shouldAddID := true
 		if m.data {
-			addDataMediaSection(d, mediaDtlsFingerprints, m.id, iceParams, candidates, connectionRole, iceGatheringState)
+			if err = addDataMediaSection(d, mediaDtlsFingerprints, m.id, iceParams, candidates, connectionRole, iceGatheringState); err != nil {
+				return nil, err
+			}
 		} else {
 			shouldAddID, err = addTransceiverSDP(d, isPlanB, mediaDtlsFingerprints, mediaEngine, m.id, iceParams, candidates, connectionRole, iceGatheringState, extMaps, m)
 			if err != nil {
@@ -496,12 +512,12 @@ func extractICEDetails(desc *sdp.SessionDescription) (string, string, []ICECandi
 
 		for _, a := range m.Attributes {
 			if a.IsICECandidate() {
-				sdpCandidate, err := a.ToICECandidate()
+				c, err := ice.UnmarshalCandidate(a.Value)
 				if err != nil {
 					return "", "", nil, err
 				}
 
-				candidate, err := newICECandidateFromSDP(sdpCandidate)
+				candidate, err := newICECandidateFromICE(c)
 				if err != nil {
 					return "", "", nil, err
 				}
@@ -577,11 +593,11 @@ func remoteExts(session *sdp.SessionDescription) (map[SDPSectionType]map[int]sdp
 		}
 		em := &sdp.ExtMap{}
 		if err := em.Unmarshal("extmap:" + attr.Value); err != nil {
-			return fmt.Errorf("failed to parse ExtMap: %v", err)
+			return fmt.Errorf("%w: %v", errSDPParseExtMap, err)
 		}
 		if remoteExtMap, ok := remoteExtMaps[mediaType][em.Value]; ok {
 			if remoteExtMap.Value != em.Value {
-				return fmt.Errorf("RemoteDescription changed some extmaps values")
+				return errSDPRemoteDescriptionChangedExtMap
 			}
 		} else {
 			remoteExtMaps[mediaType][em.Value] = *em

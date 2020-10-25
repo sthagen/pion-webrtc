@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/pion/rtp"
-	"github.com/pion/sdp/v2"
+	"github.com/pion/sdp/v3"
 )
 
 // RTPTransceiver represents a combination of an RTPSender and an RTPReceiver that share a common mid.
@@ -46,7 +46,7 @@ func (t *RTPTransceiver) Receiver() *RTPReceiver {
 // setMid sets the RTPTransceiver's mid. If it was already set, will return an error.
 func (t *RTPTransceiver) setMid(mid string) error {
 	if currentMid := t.Mid(); currentMid != "" {
-		return fmt.Errorf("cannot change transceiver mid from: %s to %s", currentMid, mid)
+		return fmt.Errorf("%w: %s to %s", errRTPTransceiverCannotChangeMid, currentMid, mid)
 	}
 	t.mid.Store(mid)
 	return nil
@@ -96,7 +96,7 @@ func (t *RTPTransceiver) setDirection(d RTPTransceiverDirection) {
 }
 
 func (t *RTPTransceiver) setSendingTrack(track *Track) error {
-	t.Sender().track = track
+	t.Sender().setTrack(track)
 	if track == nil {
 		t.setSender(nil)
 	}
@@ -111,7 +111,7 @@ func (t *RTPTransceiver) setSendingTrack(track *Track) error {
 	case track == nil && t.Direction() == RTPTransceiverDirectionSendonly:
 		t.setDirection(RTPTransceiverDirectionInactive)
 	default:
-		return fmt.Errorf("invalid state change in RTPTransceiver.setSending")
+		return errRTPTransceiverSetSendingInvalidState
 	}
 	return nil
 }
@@ -138,8 +138,9 @@ func satisfyTypeAndDirection(remoteKind RTPCodecType, remoteDirection RTPTransce
 			return []RTPTransceiverDirection{RTPTransceiverDirectionRecvonly, RTPTransceiverDirectionSendrecv}
 		case RTPTransceiverDirectionRecvonly:
 			return []RTPTransceiverDirection{RTPTransceiverDirectionSendonly, RTPTransceiverDirectionSendrecv}
+		default:
+			return []RTPTransceiverDirection{}
 		}
-		return []RTPTransceiverDirection{}
 	}
 
 	for _, possibleDirection := range getPreferredDirections() {

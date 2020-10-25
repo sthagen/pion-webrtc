@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/dtls/v2"
@@ -40,8 +41,8 @@ type DTLSTransport struct {
 
 	conn *dtls.Conn
 
-	srtpSession   *srtp.SessionSRTP
-	srtcpSession  *srtp.SessionSRTCP
+	srtpSession   atomic.Value
+	srtcpSession  atomic.Value
 	srtpEndpoint  *mux.Endpoint
 	srtcpEndpoint *mux.Endpoint
 
@@ -147,10 +148,10 @@ func (t *DTLSTransport) startSRTP() error {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 
-	if t.srtpSession != nil && t.srtcpSession != nil {
+	if t.srtpSession.Load() != nil && t.srtcpSession.Load() != nil {
 		return nil
 	} else if t.conn == nil {
-		return fmt.Errorf("the DTLS transport has not started yet")
+		return errDtlsTransportNotStarted
 	}
 
 	srtpConfig := &srtp.Config{
@@ -188,52 +189,45 @@ func (t *DTLSTransport) startSRTP() error {
 	connState := t.conn.ConnectionState()
 	err := srtpConfig.ExtractSessionKeysFromDTLS(&connState, t.role() == DTLSRoleClient)
 	if err != nil {
-		return fmt.Errorf("failed to extract sctp session keys: %v", err)
+		return fmt.Errorf("%w: %v", errDtlsKeyExtractionFailed, err)
 	}
 
 	srtpSession, err := srtp.NewSessionSRTP(t.srtpEndpoint, srtpConfig)
 	if err != nil {
-		return fmt.Errorf("failed to start srtp: %v", err)
+		return fmt.Errorf("%w: %v", errFailedToStartSRTP, err)
 	}
 
 	srtcpSession, err := srtp.NewSessionSRTCP(t.srtcpEndpoint, srtpConfig)
 	if err != nil {
-		return fmt.Errorf("failed to start srtp: %v", err)
+		return fmt.Errorf("%w: %v", errFailedToStartSRTCP, err)
 	}
 
-	t.srtpSession = srtpSession
-	t.srtcpSession = srtcpSession
+	t.srtpSession.Store(srtpSession)
+	t.srtcpSession.Store(srtcpSession)
 	return nil
 }
 
 func (t *DTLSTransport) getSRTPSession() (*srtp.SessionSRTP, error) {
-	t.lock.RLock()
-	if t.srtpSession != nil {
-		t.lock.RUnlock()
-		return t.srtpSession, nil
+	value := t.srtpSession.Load()
+	if value != nil {
+		return value.(*srtp.SessionSRTP), nil
 	}
-	t.lock.RUnlock()
-
 	if err := t.startSRTP(); err != nil {
 		return nil, err
 	}
 
-	return t.srtpSession, nil
+	return t.srtpSession.Load().(*srtp.SessionSRTP), nil
 }
 
 func (t *DTLSTransport) getSRTCPSession() (*srtp.SessionSRTCP, error) {
-	t.lock.RLock()
-	if t.srtcpSession != nil {
-		t.lock.RUnlock()
-		return t.srtcpSession, nil
+	value := t.srtcpSession.Load()
+	if value != nil {
+		return value.(*srtp.SessionSRTCP), nil
 	}
-	t.lock.RUnlock()
-
 	if err := t.startSRTP(); err != nil {
 		return nil, err
 	}
-
-	return t.srtcpSession, nil
+	return t.srtcpSession.Load().(*srtp.SessionSRTCP), nil
 }
 
 func (t *DTLSTransport) role() DTLSRole {
@@ -243,6 +237,7 @@ func (t *DTLSTransport) role() DTLSRole {
 		return DTLSRoleServer
 	case DTLSRoleServer:
 		return DTLSRoleClient
+	default:
 	}
 
 	// If SettingEngine has an explicit role
@@ -251,6 +246,7 @@ func (t *DTLSTransport) role() DTLSRole {
 		return DTLSRoleServer
 	case DTLSRoleClient:
 		return DTLSRoleClient
+	default:
 	}
 
 	// Remote was auto and no explicit role was configured via SettingEngine
@@ -273,7 +269,7 @@ func (t *DTLSTransport) Start(remoteParameters DTLSParameters) error {
 		}
 
 		if t.state != DTLSTransportStateNew {
-			return DTLSRole(0), nil, &rtcerr.InvalidStateError{Err: fmt.Errorf("attempted to start DTLSTransport that is not in new state: %s", t.state)}
+			return DTLSRole(0), nil, &rtcerr.InvalidStateError{Err: fmt.Errorf("%w: %s", errInvalidDTLSStart, t.state)}
 		}
 
 		t.srtpEndpoint = t.iceTransport.NewEndpoint(mux.MatchSRTP)
@@ -288,7 +284,8 @@ func (t *DTLSTransport) Start(remoteParameters DTLSParameters) error {
 				{
 					Certificate: [][]byte{cert.x509Cert.Raw},
 					PrivateKey:  cert.privateKey,
-				}},
+				},
+			},
 			SRTPProtectionProfiles: []dtls.SRTPProtectionProfile{dtls.SRTP_AEAD_AES_128_GCM, dtls.SRTP_AES128_CM_HMAC_SHA1_80},
 			ClientAuth:             dtls.RequireAnyClientCert,
 			LoggerFactory:          t.api.settingEngine.LoggerFactory,
@@ -351,7 +348,7 @@ func (t *DTLSTransport) Start(remoteParameters DTLSParameters) error {
 	remoteCerts := t.conn.ConnectionState().PeerCertificates
 	if len(remoteCerts) == 0 {
 		t.onStateChange(DTLSTransportStateFailed)
-		return fmt.Errorf("peer didn't provide certificate via DTLS")
+		return errNoRemoteCertificate
 	}
 	t.remoteCertificate = remoteCerts[0]
 
@@ -376,21 +373,23 @@ func (t *DTLSTransport) Stop() error {
 	// Try closing everything and collect the errors
 	var closeErrs []error
 
-	if t.srtpSession != nil {
-		if err := t.srtpSession.Close(); err != nil {
+	srtpSessionValue := t.srtpSession.Load()
+	if srtpSessionValue != nil {
+		if err := srtpSessionValue.(*srtp.SessionSRTP).Close(); err != nil {
 			closeErrs = append(closeErrs, err)
 		}
 	}
 
-	if t.srtcpSession != nil {
-		if err := t.srtcpSession.Close(); err != nil {
+	srtcpSessionValue := t.srtcpSession.Load()
+	if srtcpSessionValue != nil {
+		if err := srtcpSessionValue.(*srtp.SessionSRTCP).Close(); err != nil {
 			closeErrs = append(closeErrs, err)
 		}
 	}
 
 	if t.conn != nil {
 		// dtls connection may be closed on sctp close.
-		if err := t.conn.Close(); err != nil && err != dtls.ErrConnClosed {
+		if err := t.conn.Close(); err != nil && !errors.Is(err, dtls.ErrConnClosed) {
 			closeErrs = append(closeErrs, err)
 		}
 	}
@@ -415,12 +414,12 @@ func (t *DTLSTransport) validateFingerPrint(remoteCert *x509.Certificate) error 
 		}
 	}
 
-	return errors.New("no matching fingerprint")
+	return errNoMatchingCertificateFingerprint
 }
 
 func (t *DTLSTransport) ensureICEConn() error {
 	if t.iceTransport == nil || t.iceTransport.State() == ICETransportStateNew {
-		return errors.New("ICE connection not started")
+		return errICEConnectionNotStarted
 	}
 
 	return nil

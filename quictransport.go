@@ -35,6 +35,11 @@ type QUICTransport struct {
 	loggingFactory logging.LoggerFactory
 }
 
+var (
+	errQuicTransportFingerprintNoMatch      = errors.New("no matching fingerprint")
+	errQuicTransportICEConnectionNotStarted = errors.New("ICE connection not started")
+)
+
 // NewQUICTransport creates a new QUICTransport.
 // This constructor is part of the ORTC API. It is not
 // meant to be used together with the basic WebRTC API.
@@ -155,13 +160,13 @@ func (t *QUICTransport) validateFingerPrint(remoteParameters QUICParameters, rem
 		}
 	}
 
-	return errors.New("no matching fingerprint")
+	return errQuicTransportFingerprintNoMatch
 }
 
 func (t *QUICTransport) ensureICEConn() error {
 	if t.iceTransport == nil ||
 		t.iceTransport.State() == ICETransportStateNew {
-		return errors.New("ICE connection not started")
+		return errQuicTransportICEConnectionNotStarted
 	}
 
 	return nil

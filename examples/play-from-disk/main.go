@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand"
 	"os"
 	"time"
 
+	"github.com/pion/randutil"
 	"github.com/pion/webrtc/v3"
 	"github.com/pion/webrtc/v3/examples/internal/signal"
 	"github.com/pion/webrtc/v3/pkg/media"
@@ -59,11 +59,11 @@ func main() {
 
 	if haveVideoFile {
 		// Create a video track
-		videoTrack, addTrackErr := peerConnection.NewTrack(getPayloadType(mediaEngine, webrtc.RTPCodecTypeVideo, "VP8"), rand.Uint32(), "video", "pion")
+		videoTrack, addTrackErr := peerConnection.NewTrack(getPayloadType(mediaEngine, webrtc.RTPCodecTypeVideo, "VP8"), randutil.NewMathRandomGenerator().Uint32(), "video", "pion")
 		if addTrackErr != nil {
 			panic(addTrackErr)
 		}
-		if _, addTrackErr = peerConnection.AddTrack(videoTrack); err != nil {
+		if _, addTrackErr = peerConnection.AddTrack(videoTrack); addTrackErr != nil {
 			panic(addTrackErr)
 		}
 
@@ -106,11 +106,11 @@ func main() {
 
 	if haveAudioFile {
 		// Create a audio track
-		audioTrack, addTrackErr := peerConnection.NewTrack(getPayloadType(mediaEngine, webrtc.RTPCodecTypeAudio, "opus"), rand.Uint32(), "audio", "pion")
+		audioTrack, addTrackErr := peerConnection.NewTrack(getPayloadType(mediaEngine, webrtc.RTPCodecTypeAudio, "opus"), randutil.NewMathRandomGenerator().Uint32(), "audio", "pion")
 		if addTrackErr != nil {
 			panic(addTrackErr)
 		}
-		if _, addTrackErr = peerConnection.AddTrack(audioTrack); err != nil {
+		if _, addTrackErr = peerConnection.AddTrack(audioTrack); addTrackErr != nil {
 			panic(addTrackErr)
 		}
 
@@ -144,7 +144,7 @@ func main() {
 				}
 
 				// The amount of samples is the difference between the last and current timestamp
-				sampleCount := float64((pageHeader.GranulePosition - lastGranule))
+				sampleCount := float64(pageHeader.GranulePosition - lastGranule)
 				lastGranule = pageHeader.GranulePosition
 
 				if oggErr = audioTrack.WriteSample(media.Sample{Data: pageData, Samples: uint32(sampleCount)}); oggErr != nil {

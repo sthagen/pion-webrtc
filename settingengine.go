@@ -3,13 +3,13 @@
 package webrtc
 
 import (
-	"errors"
 	"time"
 
 	"github.com/pion/ice/v2"
 	"github.com/pion/logging"
-	"github.com/pion/sdp/v2"
+	"github.com/pion/sdp/v3"
 	"github.com/pion/transport/vnet"
+	"golang.org/x/net/proxy"
 )
 
 // SettingEngine allows influencing behavior in ways that are not
@@ -33,15 +33,15 @@ type SettingEngine struct {
 		ICERelayAcceptanceMinWait *time.Duration
 	}
 	candidates struct {
-		ICELite                        bool
-		ICENetworkTypes                []NetworkType
-		InterfaceFilter                func(string) bool
-		NAT1To1IPs                     []string
-		NAT1To1IPCandidateType         ICECandidateType
-		GenerateMulticastDNSCandidates bool
-		MulticastDNSHostName           string
-		UsernameFragment               string
-		Password                       string
+		ICELite                bool
+		ICENetworkTypes        []NetworkType
+		InterfaceFilter        func(string) bool
+		NAT1To1IPs             []string
+		NAT1To1IPCandidateType ICECandidateType
+		MulticastDNSMode       ice.MulticastDNSMode
+		MulticastDNSHostName   string
+		UsernameFragment       string
+		Password               string
 	}
 	replayProtection struct {
 		DTLS  *uint
@@ -57,6 +57,7 @@ type SettingEngine struct {
 	vnet                                      *vnet.Net
 	LoggerFactory                             logging.LoggerFactory
 	iceTCPMux                                 ice.TCPMux
+	iceProxyDialer                            proxy.Dialer
 }
 
 // DetachDataChannels enables detaching data channels. When enabled
@@ -166,7 +167,7 @@ func (e *SettingEngine) SetNAT1To1IPs(ips []string, candidateType ICECandidateTy
 // 		Act as DTLS Server, wait for ClientHello
 func (e *SettingEngine) SetAnsweringDTLSRole(role DTLSRole) error {
 	if role != DTLSRoleClient && role != DTLSRoleServer {
-		return errors.New("SetAnsweringDTLSRole must DTLSRoleClient or DTLSRoleServer")
+		return errSettingEngineSetAnsweringDTLSRole
 	}
 
 	e.answeringDTLSRole = role
@@ -182,9 +183,9 @@ func (e *SettingEngine) SetVNet(vnet *vnet.Net) {
 	e.vnet = vnet
 }
 
-// GenerateMulticastDNSCandidates instructs pion/ice to generate host candidates with mDNS hostnames instead of IP Addresses
-func (e *SettingEngine) GenerateMulticastDNSCandidates(generateMulticastDNSCandidates bool) {
-	e.candidates.GenerateMulticastDNSCandidates = generateMulticastDNSCandidates
+// SetICEMulticastDNSMode controls if pion/ice queries and generates mDNS ICE Candidates
+func (e *SettingEngine) SetICEMulticastDNSMode(multicastDNSMode ice.MulticastDNSMode) {
+	e.candidates.MulticastDNSMode = multicastDNSMode
 }
 
 // SetMulticastDNSHostName sets a static HostName to be used by pion/ice instead of generating one on startup
@@ -309,4 +310,9 @@ func (e *SettingEngine) getSDPExtensions() map[SDPSectionType][]sdp.ExtMap {
 		}
 	}
 	return e.sdpExtensions
+}
+
+// SetProxyDialer sets the proxy dialer interface based on golang.org/x/net/proxy.
+func (e *SettingEngine) SetICEProxyDialer(d proxy.Dialer) {
+	e.iceProxyDialer = d
 }
