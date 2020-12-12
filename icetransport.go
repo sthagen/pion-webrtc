@@ -27,7 +27,7 @@ type ICETransport struct {
 	onConnectionStateChangeHandler       atomic.Value // func(ICETransportState)
 	onSelectedCandidatePairChangeHandler atomic.Value // func(*ICECandidatePair)
 
-	state ICETransportState
+	state atomic.Value // ICETransportState
 
 	gatherer *ICEGatherer
 	conn     *ice.Conn
@@ -60,12 +60,13 @@ type ICETransport struct {
 
 // NewICETransport creates a new NewICETransport.
 func NewICETransport(gatherer *ICEGatherer, loggerFactory logging.LoggerFactory) *ICETransport {
-	return &ICETransport{
+	iceTransport := &ICETransport{
 		gatherer:      gatherer,
 		loggerFactory: loggerFactory,
 		log:           loggerFactory.NewLogger("ortc"),
-		state:         ICETransportStateNew,
 	}
+	iceTransport.setState(ICETransportStateNew)
+	return iceTransport
 }
 
 // Start incoming connectivity checks based on its configured role.
@@ -88,10 +89,8 @@ func (t *ICETransport) Start(gatherer *ICEGatherer, params ICEParameters, role *
 
 	if err := agent.OnConnectionStateChange(func(iceState ice.ConnectionState) {
 		state := newICETransportStateFromICE(iceState)
-		t.lock.Lock()
-		t.state = state
-		t.lock.Unlock()
 
+		t.setState(state)
 		t.onConnectionStateChange(state)
 	}); err != nil {
 		return err
@@ -235,8 +234,8 @@ func (t *ICETransport) SetRemoteCandidates(remoteCandidates []ICECandidate) erro
 		if err != nil {
 			return err
 		}
-		err = agent.AddRemoteCandidate(i)
-		if err != nil {
+
+		if err = agent.AddRemoteCandidate(i); err != nil {
 			return err
 		}
 	}
@@ -245,17 +244,23 @@ func (t *ICETransport) SetRemoteCandidates(remoteCandidates []ICECandidate) erro
 }
 
 // AddRemoteCandidate adds a candidate associated with the remote ICETransport.
-func (t *ICETransport) AddRemoteCandidate(remoteCandidate ICECandidate) error {
+func (t *ICETransport) AddRemoteCandidate(remoteCandidate *ICECandidate) error {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
 
-	if err := t.ensureGatherer(); err != nil {
+	var (
+		c   ice.Candidate
+		err error
+	)
+
+	if err = t.ensureGatherer(); err != nil {
 		return err
 	}
 
-	c, err := remoteCandidate.toICE()
-	if err != nil {
-		return err
+	if remoteCandidate != nil {
+		if c, err = remoteCandidate.toICE(); err != nil {
+			return err
+		}
 	}
 
 	agent := t.gatherer.getAgent()
@@ -263,19 +268,19 @@ func (t *ICETransport) AddRemoteCandidate(remoteCandidate ICECandidate) error {
 		return fmt.Errorf("%w: unable to add remote candidates", errICEAgentNotExist)
 	}
 
-	err = agent.AddRemoteCandidate(c)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return agent.AddRemoteCandidate(c)
 }
 
 // State returns the current ice transport state.
 func (t *ICETransport) State() ICETransportState {
-	t.lock.RLock()
-	defer t.lock.RUnlock()
-	return t.state
+	if v := t.state.Load(); v != nil {
+		return v.(ICETransportState)
+	}
+	return ICETransportState(0)
+}
+
+func (t *ICETransport) setState(i ICETransportState) {
+	t.state.Store(i)
 }
 
 // NewEndpoint registers a new endpoint on the underlying mux.

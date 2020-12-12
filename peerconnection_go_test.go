@@ -21,6 +21,7 @@ import (
 	"github.com/pion/ice/v2"
 	"github.com/pion/rtp"
 	"github.com/pion/transport/test"
+	"github.com/pion/transport/vnet"
 	"github.com/pion/webrtc/v3/internal/util"
 	"github.com/pion/webrtc/v3/pkg/rtcerr"
 	"github.com/stretchr/testify/assert"
@@ -301,7 +302,7 @@ func TestPeerConnection_EventHandlers_Go(t *testing.T) {
 	assert.NotPanics(t, func() { pc.onTrack(nil, nil) })
 	assert.NotPanics(t, func() { pc.onICEConnectionStateChange(ice.ConnectionStateNew) })
 
-	pc.OnTrack(func(t *Track, r *RTPReceiver) {
+	pc.OnTrack(func(t *TrackRemote, r *RTPReceiver) {
 		close(onTrackCalled)
 	})
 
@@ -323,7 +324,7 @@ func TestPeerConnection_EventHandlers_Go(t *testing.T) {
 	assert.NotPanics(t, func() { go pc.onDataChannelHandler(nil) })
 
 	// Verify that the set handlers are called
-	assert.NotPanics(t, func() { pc.onTrack(&Track{}, &RTPReceiver{}) })
+	assert.NotPanics(t, func() { pc.onTrack(&TrackRemote{}, &RTPReceiver{}) })
 	assert.NotPanics(t, func() { pc.onICEConnectionStateChange(ice.ConnectionStateNew) })
 	assert.NotPanics(t, func() { go pc.onDataChannelHandler(&DataChannel{api: api}) })
 
@@ -898,27 +899,32 @@ func TestICERestart(t *testing.T) {
 	firstOfferCandidates := extractCandidates(offerPC.LocalDescription().SDP)
 	firstAnswerCandidates := extractCandidates(answerPC.LocalDescription().SDP)
 
+	// Use Trickle ICE for ICE Restart
+	offerPC.OnICECandidate(func(c *ICECandidate) {
+		if c != nil {
+			assert.NoError(t, answerPC.AddICECandidate(c.ToJSON()))
+		}
+	})
+
+	answerPC.OnICECandidate(func(c *ICECandidate) {
+		if c != nil {
+			assert.NoError(t, offerPC.AddICECandidate(c.ToJSON()))
+		}
+	})
+
 	// Re-signal with ICE Restart, block until ICEConnectionStateConnected
 	connectedWaitGroup.Add(2)
 	offer, err := offerPC.CreateOffer(&OfferOptions{ICERestart: true})
 	assert.NoError(t, err)
 
-	// Block until Gathering is Complete
-	offerGatheringComplete := GatheringCompletePromise(offerPC)
 	assert.NoError(t, offerPC.SetLocalDescription(offer))
-	<-offerGatheringComplete
-
-	assert.NoError(t, answerPC.SetRemoteDescription(*offerPC.LocalDescription()))
+	assert.NoError(t, answerPC.SetRemoteDescription(offer))
 
 	answer, err := answerPC.CreateAnswer(nil)
 	assert.NoError(t, err)
 
-	// Block until Gathering is Complete
-	answerGatheringComplete := GatheringCompletePromise(answerPC)
 	assert.NoError(t, answerPC.SetLocalDescription(answer))
-	<-answerGatheringComplete
-
-	assert.NoError(t, offerPC.SetRemoteDescription(*answerPC.LocalDescription()))
+	assert.NoError(t, offerPC.SetRemoteDescription(answer))
 
 	// Block until we have connected again
 	connectedWaitGroup.Wait()
@@ -930,19 +936,125 @@ func TestICERestart(t *testing.T) {
 	assert.NoError(t, answerPC.Close())
 }
 
+// Assert error handling when an Agent is restart
+func TestICERestart_Error_Handling(t *testing.T) {
+	iceStates := make(chan ICEConnectionState, 100)
+	blockUntilICEState := func(wantedState ICEConnectionState) {
+		stateCount := 0
+		for i := range iceStates {
+			if i == wantedState {
+				stateCount++
+			}
+
+			if stateCount == 2 {
+				return
+			}
+		}
+	}
+
+	connectWithICERestart := func(offerPeerConnection, answerPeerConnection *PeerConnection) {
+		offer, err := offerPeerConnection.CreateOffer(&OfferOptions{ICERestart: true})
+		assert.NoError(t, err)
+
+		assert.NoError(t, offerPeerConnection.SetLocalDescription(offer))
+		assert.NoError(t, answerPeerConnection.SetRemoteDescription(*offerPeerConnection.LocalDescription()))
+
+		answer, err := answerPeerConnection.CreateAnswer(nil)
+		assert.NoError(t, err)
+
+		assert.NoError(t, answerPeerConnection.SetLocalDescription(answer))
+		assert.NoError(t, offerPeerConnection.SetRemoteDescription(*answerPeerConnection.LocalDescription()))
+	}
+
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	offerPeerConnection, answerPeerConnection, wan := createVNetPair(t)
+
+	pushICEState := func(i ICEConnectionState) { iceStates <- i }
+	offerPeerConnection.OnICEConnectionStateChange(pushICEState)
+	answerPeerConnection.OnICEConnectionStateChange(pushICEState)
+
+	keepPackets := &atomicBool{}
+	keepPackets.set(true)
+
+	// Add a filter that monitors the traffic on the router
+	wan.AddChunkFilter(func(c vnet.Chunk) bool {
+		return keepPackets.get()
+	})
+
+	const testMessage = "testMessage"
+
+	d, err := answerPeerConnection.CreateDataChannel("foo", nil)
+	assert.NoError(t, err)
+
+	dataChannelMessages := make(chan string, 100)
+	d.OnMessage(func(m DataChannelMessage) {
+		dataChannelMessages <- string(m.Data)
+	})
+
+	dataChannelAnswerer := make(chan *DataChannel)
+	offerPeerConnection.OnDataChannel(func(d *DataChannel) {
+		d.OnOpen(func() {
+			dataChannelAnswerer <- d
+		})
+	})
+
+	// Connect and Assert we have connected
+	assert.NoError(t, signalPair(offerPeerConnection, answerPeerConnection))
+	blockUntilICEState(ICEConnectionStateConnected)
+
+	offerPeerConnection.OnICECandidate(func(c *ICECandidate) {
+		if c != nil {
+			assert.NoError(t, answerPeerConnection.AddICECandidate(c.ToJSON()))
+		}
+	})
+
+	answerPeerConnection.OnICECandidate(func(c *ICECandidate) {
+		if c != nil {
+			assert.NoError(t, offerPeerConnection.AddICECandidate(c.ToJSON()))
+		}
+	})
+
+	dataChannel := <-dataChannelAnswerer
+	assert.NoError(t, dataChannel.SendText(testMessage))
+	assert.Equal(t, testMessage, <-dataChannelMessages)
+
+	// Drop all packets, assert we have disconnected
+	// and send a DataChannel message when disconnected
+	keepPackets.set(false)
+	blockUntilICEState(ICEConnectionStateFailed)
+	assert.NoError(t, dataChannel.SendText(testMessage))
+
+	// ICE Restart and assert we have reconnected
+	// block until our DataChannel message is delivered
+	keepPackets.set(true)
+	connectWithICERestart(offerPeerConnection, answerPeerConnection)
+	blockUntilICEState(ICEConnectionStateConnected)
+	assert.Equal(t, testMessage, <-dataChannelMessages)
+
+	assert.NoError(t, wan.Stop())
+	assert.NoError(t, offerPeerConnection.Close())
+	assert.NoError(t, answerPeerConnection.Close())
+}
+
 type trackRecords struct {
 	mu               sync.Mutex
 	trackIDs         map[string]struct{}
 	receivedTrackIDs map[string]struct{}
 }
 
-func (r *trackRecords) newTrackParameter() (uint8, uint32, string, string) {
+func (r *trackRecords) newTrack() (*TrackLocalStaticRTP, error) {
 	trackID := fmt.Sprintf("pion-track-%d", len(r.trackIDs))
+	track, err := NewTrackLocalStaticRTP(RTPCodecCapability{MimeType: "video/vp8"}, trackID, "pion")
 	r.trackIDs[trackID] = struct{}{}
-	return DefaultPayloadTypeVP8, uint32(len(r.trackIDs)), trackID, "pion"
+	return track, err
 }
 
-func (r *trackRecords) handleTrack(t *Track, _ *RTPReceiver) {
+func (r *trackRecords) handleTrack(t *TrackRemote, _ *RTPReceiver) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	tID := t.ID()
@@ -965,7 +1077,7 @@ func TestPeerConnection_MassiveTracks(t *testing.T) {
 			trackIDs:         make(map[string]struct{}),
 			receivedTrackIDs: make(map[string]struct{}),
 		}
-		tracks          = []*Track{}
+		tracks          = []*TrackLocalStaticRTP{}
 		trackCount      = 256
 		pingInterval    = 1 * time.Second
 		noiseInterval   = 100 * time.Microsecond
@@ -981,7 +1093,6 @@ func TestPeerConnection_MassiveTracks(t *testing.T) {
 				ExtensionProfile: 1,
 				Version:          2,
 				PayloadOffset:    20,
-				PayloadType:      DefaultPayloadTypeVP8,
 				SequenceNumber:   27023,
 				Timestamp:        3653407706,
 				CSRC:             []uint32{},
@@ -991,12 +1102,12 @@ func TestPeerConnection_MassiveTracks(t *testing.T) {
 		connected = make(chan struct{})
 		stopped   = make(chan struct{})
 	)
-	api.mediaEngine.RegisterDefaultCodecs()
+	assert.NoError(t, api.mediaEngine.RegisterDefaultCodecs())
 	offerPC, answerPC, err := api.newPair(Configuration{})
 	assert.NoError(t, err)
 	// Create massive tracks.
 	for range make([]struct{}, trackCount) {
-		track, err := offerPC.NewTrack(tRecs.newTrackParameter())
+		track, err := tRecs.newTrack()
 		assert.NoError(t, err)
 		_, err = offerPC.AddTrack(track)
 		assert.NoError(t, err)
@@ -1026,7 +1137,6 @@ func TestPeerConnection_MassiveTracks(t *testing.T) {
 	<-connected
 	time.Sleep(1 * time.Second)
 	for _, track := range tracks {
-		samplePkt.SSRC = track.SSRC()
 		assert.NoError(t, track.WriteRTP(samplePkt))
 	}
 	// Ping trackRecords to see if any track event not received yet.
@@ -1047,4 +1157,41 @@ func TestPeerConnection_MassiveTracks(t *testing.T) {
 	close(stopped)
 	assert.NoError(t, offerPC.Close())
 	assert.NoError(t, answerPC.Close())
+}
+
+func TestEmptyCandidate(t *testing.T) {
+	testCases := []struct {
+		ICECandidate ICECandidateInit
+		expectError  bool
+	}{
+		{ICECandidateInit{"", nil, nil, nil}, false},
+		{ICECandidateInit{
+			"211962667 1 udp 2122194687 10.0.3.1 40864 typ host generation 0",
+			nil, nil, nil,
+		}, false},
+		{ICECandidateInit{
+			"1234567",
+			nil, nil, nil,
+		}, true},
+	}
+
+	for i, testCase := range testCases {
+		peerConn, err := NewPeerConnection(Configuration{})
+		if err != nil {
+			t.Errorf("Case %d: got error: %v", i, err)
+		}
+
+		err = peerConn.SetRemoteDescription(SessionDescription{Type: SDPTypeOffer, SDP: minimalOffer})
+		if err != nil {
+			t.Errorf("Case %d: got error: %v", i, err)
+		}
+
+		if testCase.expectError {
+			assert.Error(t, peerConn.AddICECandidate(testCase.ICECandidate))
+		} else {
+			assert.NoError(t, peerConn.AddICECandidate(testCase.ICECandidate))
+		}
+
+		assert.NoError(t, peerConn.Close())
+	}
 }
