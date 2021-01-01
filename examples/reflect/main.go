@@ -50,9 +50,22 @@ func main() {
 	}
 
 	// Add this newly created track to the PeerConnection
-	if _, err = peerConnection.AddTrack(outputTrack); err != nil {
+	rtpSender, err := peerConnection.AddTrack(outputTrack)
+	if err != nil {
 		panic(err)
 	}
+
+	// Read incoming RTCP packets
+	// Before these packets are retuned they are processed by interceptors. For things
+	// like NACK this needs to be called.
+	go func() {
+		rtcpBuf := make([]byte, 1500)
+		for {
+			if _, _, rtcpErr := rtpSender.Read(rtcpBuf); rtcpErr != nil {
+				return
+			}
+		}
+	}()
 
 	// Wait for the offer to be pasted
 	offer := webrtc.SessionDescription{}
@@ -82,7 +95,7 @@ func main() {
 		fmt.Printf("Track has started, of type %d: %s \n", track.PayloadType(), track.Codec().MimeType)
 		for {
 			// Read RTP packets being sent to Pion
-			rtp, readErr := track.ReadRTP()
+			rtp, _, readErr := track.ReadRTP()
 			if readErr != nil {
 				panic(readErr)
 			}

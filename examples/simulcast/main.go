@@ -62,6 +62,21 @@ func main() {
 		panic(err)
 	}
 
+	// Read incoming RTCP packets
+	// Before these packets are retuned they are processed by interceptors. For things
+	// like NACK this needs to be called.
+	processRTCP := func(rtpSender *webrtc.RTPSender) {
+		rtcpBuf := make([]byte, 1500)
+		for {
+			if _, _, rtcpErr := rtpSender.Read(rtcpBuf); rtcpErr != nil {
+				return
+			}
+		}
+	}
+	for _, rtpSender := range peerConnection.GetSenders() {
+		go processRTCP(rtpSender)
+	}
+
 	// Wait for the offer to be pasted
 	offer := webrtc.SessionDescription{}
 	signal.Decode(signal.MustReadStdin(), &offer)
@@ -92,7 +107,7 @@ func main() {
 		}()
 		for {
 			// Read RTP packets being sent to Pion
-			packet, readErr := track.ReadRTP()
+			packet, _, readErr := track.ReadRTP()
 			if readErr != nil {
 				panic(readErr)
 			}
@@ -113,14 +128,22 @@ func main() {
 		panic(err)
 	}
 
+	// Create channel that is blocked until ICE Gathering is complete
+	gatherComplete := webrtc.GatheringCompletePromise(peerConnection)
+
 	// Sets the LocalDescription, and starts our UDP listeners
 	err = peerConnection.SetLocalDescription(answer)
 	if err != nil {
 		panic(err)
 	}
 
+	// Block until ICE Gathering is complete, disabling trickle ICE
+	// we do this because we only can exchange one signaling message
+	// in a production application you should exchange ICE Candidates via OnICECandidate
+	<-gatherComplete
+
 	// Output the answer in base64 so we can paste it in browser
-	fmt.Printf("Paste below base64 in browser:\n%v\n", signal.Encode(answer))
+	fmt.Println(signal.Encode(*peerConnection.LocalDescription()))
 
 	// Block forever
 	select {}

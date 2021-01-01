@@ -81,14 +81,24 @@ type PeerConnection struct {
 	interceptorRTCPWriter interceptor.RTCPWriter
 }
 
-// NewPeerConnection creates a peerconnection with the default
-// codecs. See API.NewPeerConnection for details.
+// NewPeerConnection creates a PeerConnection with the default codecs and
+// interceptors.  See RegisterDefaultCodecs and RegisterDefaultInterceptors.
+//
+// If you wish to customize the set of available codecs or the set of
+// active interceptors, create a MediaEngine and call api.NewPeerConnection
+// instead of this function.
 func NewPeerConnection(configuration Configuration) (*PeerConnection, error) {
-	m := MediaEngine{}
+	m := &MediaEngine{}
 	if err := m.RegisterDefaultCodecs(); err != nil {
 		return nil, err
 	}
-	api := NewAPI(WithMediaEngine(&m))
+
+	i := &interceptor.Registry{}
+	if err := RegisterDefaultInterceptors(m, i); err != nil {
+		return nil, err
+	}
+
+	api := NewAPI(WithMediaEngine(m), WithInterceptorRegistry(i))
 	return api.NewPeerConnection(configuration)
 }
 
@@ -1152,7 +1162,6 @@ func (pc *PeerConnection) startReceiver(incoming trackDetails, receiver *RTPRece
 		receiver.Track().kind = receiver.kind
 		receiver.Track().codec = params.Codecs[0]
 		receiver.Track().params = params
-		receiver.Track().bindInterceptor()
 		receiver.Track().mu.Unlock()
 
 		pc.onTrack(receiver.Track(), receiver)
