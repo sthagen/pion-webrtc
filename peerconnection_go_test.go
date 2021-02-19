@@ -374,8 +374,7 @@ func TestPeerConnection_ShutdownNoDTLS(t *testing.T) {
 	})
 
 	<-iceComplete
-	assert.NoError(t, offerPC.Close())
-	assert.NoError(t, answerPC.Close())
+	closePairNow(t, offerPC, answerPC)
 }
 
 func TestPeerConnection_PropertyGetters(t *testing.T) {
@@ -598,8 +597,7 @@ func TestPeerConnection_OfferingLite(t *testing.T) {
 	})
 
 	<-iceComplete
-	assert.NoError(t, offerPC.Close())
-	assert.NoError(t, answerPC.Close())
+	closePairNow(t, offerPC, answerPC)
 }
 
 func TestPeerConnection_AnsweringLite(t *testing.T) {
@@ -637,8 +635,7 @@ func TestPeerConnection_AnsweringLite(t *testing.T) {
 	})
 
 	<-iceComplete
-	assert.NoError(t, offerPC.Close())
-	assert.NoError(t, answerPC.Close())
+	closePairNow(t, offerPC, answerPC)
 }
 
 func TestOnICEGatheringStateChange(t *testing.T) {
@@ -792,8 +789,7 @@ func TestPeerConnectionTrickle(t *testing.T) {
 
 	<-answerPCConnected.Done()
 	<-offerPCConnected.Done()
-	assert.NoError(t, offerPC.Close())
-	assert.NoError(t, answerPC.Close())
+	closePairNow(t, offerPC, answerPC)
 }
 
 // Issue #1121, assert populateLocalCandidates doesn't mutate
@@ -858,8 +854,7 @@ func TestMulticastDNSCandidates(t *testing.T) {
 	})
 	<-onDataChannel.Done()
 
-	assert.NoError(t, pcOffer.Close())
-	assert.NoError(t, pcAnswer.Close())
+	closePairNow(t, pcOffer, pcAnswer)
 }
 
 func TestICERestart(t *testing.T) {
@@ -938,8 +933,7 @@ func TestICERestart(t *testing.T) {
 	// Compare ICE Candidates across each run, fail if they haven't changed
 	assert.NotEqual(t, firstOfferCandidates, extractCandidates(offerPC.LocalDescription().SDP))
 	assert.NotEqual(t, firstAnswerCandidates, extractCandidates(answerPC.LocalDescription().SDP))
-	assert.NoError(t, offerPC.Close())
-	assert.NoError(t, answerPC.Close())
+	closePairNow(t, offerPC, answerPC)
 }
 
 // Assert error handling when an Agent is restart
@@ -1043,8 +1037,7 @@ func TestICERestart_Error_Handling(t *testing.T) {
 	assert.Equal(t, testMessage, <-dataChannelMessages)
 
 	assert.NoError(t, wan.Stop())
-	assert.NoError(t, offerPeerConnection.Close())
-	assert.NoError(t, answerPeerConnection.Close())
+	closePairNow(t, offerPeerConnection, answerPeerConnection)
 }
 
 type trackRecords struct {
@@ -1161,8 +1154,7 @@ func TestPeerConnection_MassiveTracks(t *testing.T) {
 		}
 	}
 	close(stopped)
-	assert.NoError(t, offerPC.Close())
-	assert.NoError(t, answerPC.Close())
+	closePairNow(t, offerPC, answerPC)
 }
 
 func TestEmptyCandidate(t *testing.T) {
@@ -1200,4 +1192,39 @@ func TestEmptyCandidate(t *testing.T) {
 
 		assert.NoError(t, peerConn.Close())
 	}
+}
+
+const liteOffer = `v=0
+o=- 4596489990601351948 2 IN IP4 127.0.0.1
+s=-
+t=0 0
+a=msid-semantic: WMS
+a=ice-lite
+m=application 47299 DTLS/SCTP 5000
+c=IN IP4 192.168.20.129
+a=ice-ufrag:1/MvHwjAyVf27aLu
+a=ice-pwd:3dBU7cFOBl120v33cynDvN1E
+a=fingerprint:sha-256 75:74:5A:A6:A4:E5:52:F4:A7:67:4C:01:C7:EE:91:3F:21:3D:A2:E3:53:7B:6F:30:86:F2:30:AA:65:FB:04:24
+a=mid:data
+`
+
+// this test asserts that if an ice-lite offer is received,
+// pion will take the ICE-CONTROLLING role
+func TestICELite(t *testing.T) {
+	peerConnection, err := NewPeerConnection(Configuration{})
+	assert.NoError(t, err)
+
+	assert.NoError(t, peerConnection.SetRemoteDescription(
+		SessionDescription{SDP: liteOffer, Type: SDPTypeOffer},
+	))
+
+	SDPAnswer, err := peerConnection.CreateAnswer(nil)
+	assert.NoError(t, err)
+
+	assert.NoError(t, peerConnection.SetLocalDescription(SDPAnswer))
+
+	assert.Equal(t, ICERoleControlling, peerConnection.iceTransport.role,
+		"pion did not set state to ICE-CONTROLLED against ice-light offer")
+
+	assert.NoError(t, peerConnection.Close())
 }
