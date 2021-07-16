@@ -384,17 +384,17 @@ func TestPeerConnection_PropertyGetters(t *testing.T) {
 		currentRemoteDescription: &SessionDescription{},
 		pendingRemoteDescription: &SessionDescription{},
 		signalingState:           SignalingStateHaveLocalOffer,
-		iceConnectionState:       ICEConnectionStateChecking,
-		connectionState:          PeerConnectionStateConnecting,
 	}
+	pc.iceConnectionState.Store(ICEConnectionStateChecking)
+	pc.connectionState.Store(PeerConnectionStateConnecting)
 
 	assert.Equal(t, pc.currentLocalDescription, pc.CurrentLocalDescription(), "should match")
 	assert.Equal(t, pc.pendingLocalDescription, pc.PendingLocalDescription(), "should match")
 	assert.Equal(t, pc.currentRemoteDescription, pc.CurrentRemoteDescription(), "should match")
 	assert.Equal(t, pc.pendingRemoteDescription, pc.PendingRemoteDescription(), "should match")
 	assert.Equal(t, pc.signalingState, pc.SignalingState(), "should match")
-	assert.Equal(t, pc.iceConnectionState, pc.ICEConnectionState(), "should match")
-	assert.Equal(t, pc.connectionState, pc.ConnectionState(), "should match")
+	assert.Equal(t, pc.iceConnectionState.Load(), pc.ICEConnectionState(), "should match")
+	assert.Equal(t, pc.connectionState.Load(), pc.ConnectionState(), "should match")
 }
 
 func TestPeerConnection_AnswerWithoutOffer(t *testing.T) {
@@ -1246,7 +1246,7 @@ func TestPeerConnection_TransceiverDirection(t *testing.T) {
 				return err
 			}
 
-			_, err = pc.AddTransceiverFromTrack(track, []RtpTransceiverInit{
+			_, err = pc.AddTransceiverFromTrack(track, []RTPTransceiverInit{
 				{Direction: dir},
 			}...)
 			return err
@@ -1254,7 +1254,7 @@ func TestPeerConnection_TransceiverDirection(t *testing.T) {
 
 		_, err := pc.AddTransceiverFromKind(
 			RTPCodecTypeVideo,
-			RtpTransceiverInit{Direction: dir},
+			RTPTransceiverInit{Direction: dir},
 		)
 		return err
 	}
@@ -1349,4 +1349,88 @@ func TestPeerConnection_TransceiverDirection(t *testing.T) {
 			assert.NoError(t, pcAnswer.Close())
 		})
 	}
+}
+
+func TestPeerConnection_SessionID(t *testing.T) {
+	defer test.TimeOut(time.Second * 10).Stop()
+	defer test.CheckRoutines(t)()
+
+	pcOffer, pcAnswer, err := newPair()
+	assert.NoError(t, err)
+	var offerSessionID uint64
+	var offerSessionVersion uint64
+	var answerSessionID uint64
+	var answerSessionVersion uint64
+	for i := 0; i < 10; i++ {
+		assert.NoError(t, signalPair(pcOffer, pcAnswer))
+		offer := pcOffer.LocalDescription().parsed
+		sessionID := offer.Origin.SessionID
+		sessionVersion := offer.Origin.SessionVersion
+		if offerSessionID == 0 {
+			offerSessionID = sessionID
+			offerSessionVersion = sessionVersion
+		} else {
+			if offerSessionID != sessionID {
+				t.Errorf("offer[%v] session id mismatch: expected=%v, got=%v", i, offerSessionID, sessionID)
+			}
+			if offerSessionVersion+1 != sessionVersion {
+				t.Errorf("offer[%v] session version mismatch: expected=%v, got=%v", i, offerSessionVersion+1, sessionVersion)
+			}
+			offerSessionVersion++
+		}
+
+		answer := pcAnswer.LocalDescription().parsed
+		sessionID = answer.Origin.SessionID
+		sessionVersion = answer.Origin.SessionVersion
+		if answerSessionID == 0 {
+			answerSessionID = sessionID
+			answerSessionVersion = sessionVersion
+		} else {
+			if answerSessionID != sessionID {
+				t.Errorf("answer[%v] session id mismatch: expected=%v, got=%v", i, answerSessionID, sessionID)
+			}
+			if answerSessionVersion+1 != sessionVersion {
+				t.Errorf("answer[%v] session version mismatch: expected=%v, got=%v", i, answerSessionVersion+1, sessionVersion)
+			}
+			answerSessionVersion++
+		}
+	}
+	closePairNow(t, pcOffer, pcAnswer)
+}
+
+func TestPeerConnectionNilCallback(t *testing.T) {
+	pc, err := NewPeerConnection(Configuration{})
+	assert.NoError(t, err)
+
+	pc.onSignalingStateChange(SignalingStateStable)
+	pc.OnSignalingStateChange(func(ss SignalingState) {
+		t.Error("OnSignalingStateChange called")
+	})
+	pc.OnSignalingStateChange(nil)
+	pc.onSignalingStateChange(SignalingStateStable)
+
+	pc.onConnectionStateChange(PeerConnectionStateNew)
+	pc.OnConnectionStateChange(func(pcs PeerConnectionState) {
+		t.Error("OnConnectionStateChange called")
+	})
+	pc.OnConnectionStateChange(nil)
+	pc.onConnectionStateChange(PeerConnectionStateNew)
+
+	pc.onICEConnectionStateChange(ICEConnectionStateNew)
+	pc.OnICEConnectionStateChange(func(ics ICEConnectionState) {
+		t.Error("OnConnectionStateChange called")
+	})
+	pc.OnICEConnectionStateChange(nil)
+	pc.onICEConnectionStateChange(ICEConnectionStateNew)
+
+	pc.onNegotiationNeeded()
+	pc.negotiationNeededOp()
+	pc.OnNegotiationNeeded(func() {
+		t.Error("OnNegotiationNeeded called")
+	})
+	pc.OnNegotiationNeeded(nil)
+	pc.onNegotiationNeeded()
+	pc.negotiationNeededOp()
+
+	assert.NoError(t, pc.Close())
 }

@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/pion/logging"
 	"github.com/pion/webrtc/v3"
@@ -14,8 +15,7 @@ import (
 // customLogger satisfies the interface logging.LeveledLogger
 // a logger is created per subsystem in Pion, so you can have custom
 // behavior per subsystem (ICE, DTLS, SCTP...)
-type customLogger struct {
-}
+type customLogger struct{}
 
 // Print all messages except trace
 func (c customLogger) Trace(msg string)                          {}
@@ -41,8 +41,7 @@ func (c customLogger) Errorf(format string, args ...interface{}) {
 // customLoggerFactory satisfies the interface logging.LoggerFactory
 // This allows us to create different loggers per subsystem. So we can
 // add custom behavior
-type customLoggerFactory struct {
-}
+type customLoggerFactory struct{}
 
 func (c customLoggerFactory) NewLogger(subsystem string) logging.LeveledLogger {
 	fmt.Printf("Creating logger for %s \n", subsystem)
@@ -62,6 +61,11 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	defer func() {
+		if cErr := offerPeerConnection.Close(); cErr != nil {
+			fmt.Printf("cannot close offerPeerConnection: %v\n", cErr)
+		}
+	}()
 
 	// We need a DataChannel so we can have ICE Candidates
 	if _, err = offerPeerConnection.CreateDataChannel("custom-logger", nil); err != nil {
@@ -73,6 +77,39 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	defer func() {
+		if cErr := answerPeerConnection.Close(); cErr != nil {
+			fmt.Printf("cannot close answerPeerConnection: %v\n", cErr)
+		}
+	}()
+
+	// Set the handler for Peer connection state
+	// This will notify you when the peer has connected/disconnected
+	offerPeerConnection.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+		fmt.Printf("Peer Connection State has changed: %s (offerer)\n", s.String())
+
+		if s == webrtc.PeerConnectionStateFailed {
+			// Wait until PeerConnection has had no network activity for 30 seconds or another failure. It may be reconnected using an ICE Restart.
+			// Use webrtc.PeerConnectionStateDisconnected if you are interested in detecting faster timeout.
+			// Note that the PeerConnection may come back from PeerConnectionStateDisconnected.
+			fmt.Println("Peer Connection has gone to failed exiting")
+			os.Exit(0)
+		}
+	})
+
+	// Set the handler for Peer connection state
+	// This will notify you when the peer has connected/disconnected
+	answerPeerConnection.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {
+		fmt.Printf("Peer Connection State has changed: %s (answerer)\n", s.String())
+
+		if s == webrtc.PeerConnectionStateFailed {
+			// Wait until PeerConnection has had no network activity for 30 seconds or another failure. It may be reconnected using an ICE Restart.
+			// Use webrtc.PeerConnectionStateDisconnected if you are interested in detecting faster timeout.
+			// Note that the PeerConnection may come back from PeerConnectionStateDisconnected.
+			fmt.Println("Peer Connection has gone to failed exiting")
+			os.Exit(0)
+		}
+	})
 
 	// Set ICE Candidate handler. As soon as a PeerConnection has gathered a candidate
 	// send it to the other peer
@@ -128,5 +165,6 @@ func main() {
 		panic(err)
 	}
 
+	// Block forever
 	select {}
 }

@@ -19,6 +19,7 @@ type RTPSender struct {
 
 	srtpStream      *srtpWriterFuture
 	rtcpInterceptor interceptor.RTCPReader
+	streamInfo      interceptor.StreamInfo
 
 	context TrackLocalContext
 
@@ -36,6 +37,8 @@ type RTPSender struct {
 	// A reference to the associated api object
 	api *API
 	id  string
+
+	tr *RTPTransceiver
 
 	mu                     sync.RWMutex
 	sendCalled, stopCalled chan struct{}
@@ -87,6 +90,12 @@ func (r *RTPSender) setNegotiated() {
 	r.negotiated = true
 }
 
+func (r *RTPSender) setRTPTransceiver(tr *RTPTransceiver) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.tr = tr
+}
+
 // Transport returns the currently-configured *DTLSTransport or nil
 // if one has not yet been configured
 func (r *RTPSender) Transport() *DTLSTransport {
@@ -95,10 +104,8 @@ func (r *RTPSender) Transport() *DTLSTransport {
 	return r.transport
 }
 
-// GetParameters describes the current configuration for the encoding and
-// transmission of media on the sender's track.
-func (r *RTPSender) GetParameters() RTPSendParameters {
-	return RTPSendParameters{
+func (r *RTPSender) getParameters() RTPSendParameters {
+	sendParameters := RTPSendParameters{
 		RTPParameters: r.api.mediaEngine.getRTPParametersByKind(
 			r.track.Kind(),
 			[]RTPTransceiverDirection{RTPTransceiverDirectionSendonly},
@@ -112,6 +119,16 @@ func (r *RTPSender) GetParameters() RTPSendParameters {
 			},
 		},
 	}
+	sendParameters.Codecs = r.tr.getCodecs()
+	return sendParameters
+}
+
+// GetParameters describes the current configuration for the encoding and
+// transmission of media on the sender's track.
+func (r *RTPSender) GetParameters() RTPSendParameters {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.getParameters()
 }
 
 // Track returns the RTCRtpTransceiver track, or nil
@@ -139,13 +156,24 @@ func (r *RTPSender) ReplaceTrack(track TrackLocal) error {
 		return nil
 	}
 
-	if _, err := track.Bind(r.context); err != nil {
+	codec, err := track.Bind(TrackLocalContext{
+		id:          r.context.id,
+		params:      r.api.mediaEngine.getRTPParametersByKind(r.track.Kind(), []RTPTransceiverDirection{RTPTransceiverDirectionSendonly}),
+		ssrc:        r.context.ssrc,
+		writeStream: r.context.writeStream,
+	})
+	if err != nil {
 		// Re-bind the original track
 		if _, reBindErr := r.track.Bind(r.context); reBindErr != nil {
 			return reBindErr
 		}
 
 		return err
+	}
+
+	// Codec has changed
+	if r.payloadType != codec.PayloadType {
+		r.context.params.Codecs = []RTPCodecParameters{codec}
 	}
 
 	r.track = track
@@ -175,8 +203,8 @@ func (r *RTPSender) Send(parameters RTPSendParameters) error {
 	}
 	r.context.params.Codecs = []RTPCodecParameters{codec}
 
-	streamInfo := createStreamInfo(r.id, parameters.Encodings[0].SSRC, codec.PayloadType, codec.RTPCodecCapability, parameters.HeaderExtensions)
-	rtpInterceptor := r.api.interceptor.BindLocalStream(&streamInfo, interceptor.RTPWriterFunc(func(header *rtp.Header, payload []byte, attributes interceptor.Attributes) (int, error) {
+	r.streamInfo = createStreamInfo(r.id, parameters.Encodings[0].SSRC, codec.PayloadType, codec.RTPCodecCapability, parameters.HeaderExtensions)
+	rtpInterceptor := r.api.interceptor.BindLocalStream(&r.streamInfo, interceptor.RTPWriterFunc(func(header *rtp.Header, payload []byte, attributes interceptor.Attributes) (int, error) {
 		return r.srtpStream.WriteRTP(header, payload)
 	}))
 	writeStream.interceptor.Store(rtpInterceptor)
@@ -204,6 +232,8 @@ func (r *RTPSender) Stop() error {
 	if err := r.ReplaceTrack(nil); err != nil {
 		return err
 	}
+
+	r.api.interceptor.UnbindLocalStream(&r.streamInfo)
 
 	return r.srtpStream.Close()
 }

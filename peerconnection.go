@@ -31,6 +31,8 @@ type PeerConnection struct {
 	statsID string
 	mu      sync.RWMutex
 
+	sdpOrigin sdp.Origin
+
 	// ops is an operations queue which will ensure the enqueued actions are
 	// executed in order. It is used for asynchronously, but serially processing
 	// remote and local descriptions
@@ -43,8 +45,8 @@ type PeerConnection struct {
 	currentRemoteDescription *SessionDescription
 	pendingRemoteDescription *SessionDescription
 	signalingState           SignalingState
-	iceConnectionState       ICEConnectionState
-	connectionState          PeerConnectionState
+	iceConnectionState       atomic.Value // ICEConnectionState
+	connectionState          atomic.Value // PeerConnectionState
 
 	idpLoginURL *string
 
@@ -64,8 +66,8 @@ type PeerConnection struct {
 	rtpTransceivers []*RTPTransceiver
 
 	onSignalingStateChangeHandler     func(SignalingState)
-	onICEConnectionStateChangeHandler func(ICEConnectionState)
-	onConnectionStateChangeHandler    func(PeerConnectionState)
+	onICEConnectionStateChangeHandler atomic.Value // func(ICEConnectionState)
+	onConnectionStateChangeHandler    atomic.Value // func(PeerConnectionState)
 	onTrackHandler                    func(*TrackRemote, *RTPReceiver)
 	onDataChannelHandler              func(*DataChannel)
 	onNegotiationNeededHandler        atomic.Value // func()
@@ -126,12 +128,12 @@ func (api *API) NewPeerConnection(configuration Configuration) (*PeerConnection,
 		lastAnswer:             "",
 		greaterMid:             -1,
 		signalingState:         SignalingStateStable,
-		iceConnectionState:     ICEConnectionStateNew,
-		connectionState:        PeerConnectionStateNew,
 
 		api: api,
 		log: api.settingEngine.LoggerFactory.NewLogger("pc"),
 	}
+	pc.iceConnectionState.Store(ICEConnectionStateNew)
+	pc.connectionState.Store(PeerConnectionStateNew)
 
 	if !api.settingEngine.disableMediaEngineCopy {
 		pc.api = &API{
@@ -277,26 +279,24 @@ func (pc *PeerConnection) OnNegotiationNeeded(f func()) {
 	pc.onNegotiationNeededHandler.Store(f)
 }
 
+// onNegotiationNeeded enqueues negotiationNeededOp if necessary
+// caller of this method should hold `pc.mu` lock
 func (pc *PeerConnection) onNegotiationNeeded() {
 	// https://w3c.github.io/webrtc-pc/#updating-the-negotiation-needed-flag
 	// non-canon step 1
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
 	if pc.negotiationNeededState == negotiationNeededStateRun {
 		pc.negotiationNeededState = negotiationNeededStateQueue
 		return
 	} else if pc.negotiationNeededState == negotiationNeededStateQueue {
 		return
 	}
-
 	pc.negotiationNeededState = negotiationNeededStateRun
-
 	pc.ops.Enqueue(pc.negotiationNeededOp)
 }
 
 func (pc *PeerConnection) negotiationNeededOp() {
 	// Don't run NegotiatedNeeded checks if OnNegotiationNeeded is not set
-	if handler := pc.onNegotiationNeededHandler.Load(); handler == nil {
+	if handler, ok := pc.onNegotiationNeededHandler.Load().(func()); !ok || handler == nil {
 		return
 	}
 
@@ -314,11 +314,11 @@ func (pc *PeerConnection) negotiationNeededOp() {
 	// non-canon, run again if there was a request
 	defer func() {
 		pc.mu.Lock()
+		defer pc.mu.Unlock()
 		if pc.negotiationNeededState == negotiationNeededStateQueue {
 			defer pc.onNegotiationNeeded()
 		}
 		pc.negotiationNeededState = negotiationNeededStateEmpty
-		pc.mu.Unlock()
 	}()
 
 	// Step 2.3
@@ -458,29 +458,29 @@ func (pc *PeerConnection) onTrack(t *TrackRemote, r *RTPReceiver) {
 // OnICEConnectionStateChange sets an event handler which is called
 // when an ICE connection state is changed.
 func (pc *PeerConnection) OnICEConnectionStateChange(f func(ICEConnectionState)) {
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
-	pc.onICEConnectionStateChangeHandler = f
+	pc.onICEConnectionStateChangeHandler.Store(f)
 }
 
 func (pc *PeerConnection) onICEConnectionStateChange(cs ICEConnectionState) {
-	pc.mu.Lock()
-	pc.iceConnectionState = cs
-	handler := pc.onICEConnectionStateChangeHandler
-	pc.mu.Unlock()
-
+	pc.iceConnectionState.Store(cs)
 	pc.log.Infof("ICE connection state changed: %s", cs)
-	if handler != nil {
-		go handler(cs)
+	if handler, ok := pc.onICEConnectionStateChangeHandler.Load().(func(ICEConnectionState)); ok && handler != nil {
+		handler(cs)
 	}
 }
 
 // OnConnectionStateChange sets an event handler which is called
 // when the PeerConnectionState has changed
 func (pc *PeerConnection) OnConnectionStateChange(f func(PeerConnectionState)) {
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
-	pc.onConnectionStateChangeHandler = f
+	pc.onConnectionStateChangeHandler.Store(f)
+}
+
+func (pc *PeerConnection) onConnectionStateChange(cs PeerConnectionState) {
+	pc.connectionState.Store(cs)
+	pc.log.Infof("peer connection state changed: %s", cs)
+	if handler, ok := pc.onConnectionStateChangeHandler.Load().(func(PeerConnectionState)); ok && handler != nil {
+		go handler(cs)
+	}
 }
 
 // SetConfiguration updates the configuration of this PeerConnection object.
@@ -570,8 +570,10 @@ func (pc *PeerConnection) getStatsID() string {
 	return pc.statsID
 }
 
+// hasLocalDescriptionChanged returns whether local media (rtpTransceivers) has changed
+// caller of this method should hold `pc.mu` lock
 func (pc *PeerConnection) hasLocalDescriptionChanged(desc *SessionDescription) bool {
-	for _, t := range pc.GetTransceivers() {
+	for _, t := range pc.rtpTransceivers {
 		m := getByMid(t.Mid(), desc)
 		if m == nil {
 			return true
@@ -581,7 +583,6 @@ func (pc *PeerConnection) hasLocalDescriptionChanged(desc *SessionDescription) b
 			return true
 		}
 	}
-
 	return false
 }
 
@@ -615,17 +616,19 @@ func (pc *PeerConnection) CreateOffer(options *OfferOptions) (SessionDescription
 	// steps to create an offer, a video RTCRtpTransceiver was added, requiring additional
 	// inspection of video system resources.
 	count := 0
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
 	for {
 		// We cache current transceivers to ensure they aren't
 		// mutated during offer generation. We later check if they have
 		// been mutated and recompute the offer if necessary.
-		currentTransceivers := pc.GetTransceivers()
+		currentTransceivers := pc.rtpTransceivers
 
 		// in-parallel steps to create an offer
 		// https://w3c.github.io/webrtc-pc/#dfn-in-parallel-steps-to-create-an-offer
 		isPlanB := pc.configuration.SDPSemantics == SDPSemanticsPlanB
 		if pc.currentRemoteDescription != nil {
-			isPlanB = descriptionIsPlanB(pc.RemoteDescription())
+			isPlanB = descriptionIsPlanB(pc.currentRemoteDescription)
 		}
 
 		// include unmatched local transceivers
@@ -669,6 +672,7 @@ func (pc *PeerConnection) CreateOffer(options *OfferOptions) (SessionDescription
 			return SessionDescription{}, err
 		}
 
+		updateSDPOrigin(&pc.sdpOrigin, d)
 		sdpBytes, err := d.Marshal()
 		if err != nil {
 			return SessionDescription{}, err
@@ -710,9 +714,6 @@ func (pc *PeerConnection) createICEGatherer() (*ICEGatherer, error) {
 // Update the PeerConnectionState given the state of relevant transports
 // https://www.w3.org/TR/webrtc/#rtcpeerconnectionstate-enum
 func (pc *PeerConnection) updateConnectionState(iceConnectionState ICEConnectionState, dtlsTransportState DTLSTransportState) {
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
-
 	connectionState := PeerConnectionStateNew
 	switch {
 	// The RTCPeerConnection object's [[IsClosed]] slot is true.
@@ -739,16 +740,11 @@ func (pc *PeerConnection) updateConnectionState(iceConnectionState ICEConnection
 		connectionState = PeerConnectionStateConnecting
 	}
 
-	if pc.connectionState == connectionState {
+	if pc.connectionState.Load() == connectionState {
 		return
 	}
 
-	pc.log.Infof("peer connection state changed: %s", connectionState)
-	pc.connectionState = connectionState
-	handler := pc.onConnectionStateChangeHandler
-	if handler != nil {
-		go handler(connectionState)
-	}
+	pc.onConnectionStateChange(connectionState)
 }
 
 func (pc *PeerConnection) createICETransport() *ICETransport {
@@ -799,13 +795,15 @@ func (pc *PeerConnection) CreateAnswer(options *AnswerOptions) (SessionDescripti
 	if connectionRole == sdp.ConnectionRole(0) {
 		connectionRole = connectionRoleFromDtlsRole(defaultDtlsRoleAnswer)
 	}
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
 
-	currentTransceivers := pc.GetTransceivers()
-	d, err := pc.generateMatchedSDP(currentTransceivers, useIdentity, false /*includeUnmatched */, connectionRole)
+	d, err := pc.generateMatchedSDP(pc.rtpTransceivers, useIdentity, false /*includeUnmatched */, connectionRole)
 	if err != nil {
 		return SessionDescription{}, err
 	}
 
+	updateSDPOrigin(&pc.sdpOrigin, d)
 	sdpBytes, err := d.Marshal()
 	if err != nil {
 		return SessionDescription{}, err
@@ -926,7 +924,9 @@ func (pc *PeerConnection) setDescription(sd *SessionDescription, op stateChangeO
 		pc.signalingState.Set(nextState)
 		if pc.signalingState.Get() == SignalingStateStable {
 			pc.isNegotiationNeeded.set(false)
+			pc.mu.Lock()
 			pc.onNegotiationNeeded()
+			pc.mu.Unlock()
 		}
 		pc.onSignalingStateChange(nextState)
 	}
@@ -1044,7 +1044,8 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error { 
 				}
 			}
 
-			if t == nil {
+			switch {
+			case t == nil:
 				receiver, err := pc.api.NewRTPReceiver(kind, pc.dtlsTransport)
 				if err != nil {
 					return err
@@ -1055,12 +1056,17 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error { 
 					localDirection = RTPTransceiverDirectionSendonly
 				}
 
-				t = pc.newRTPTransceiver(receiver, nil, localDirection, kind)
-
-				pc.onNegotiationNeeded()
-			} else if direction == RTPTransceiverDirectionRecvonly {
+				t = newRTPTransceiver(receiver, nil, localDirection, kind, pc.api)
+				pc.mu.Lock()
+				pc.addRTPTransceiver(t)
+				pc.mu.Unlock()
+			case direction == RTPTransceiverDirectionRecvonly:
 				if t.Direction() == RTPTransceiverDirectionSendrecv {
 					t.setDirection(RTPTransceiverDirectionSendonly)
+				}
+			case direction == RTPTransceiverDirectionSendrecv:
+				if t.Direction() == RTPTransceiverDirectionSendonly {
+					t.setDirection(RTPTransceiverDirectionSendrecv)
 				}
 			}
 
@@ -1176,22 +1182,17 @@ func (pc *PeerConnection) startReceiver(incoming trackDetails, receiver *RTPRece
 	}
 
 	go func() {
-		if err := receiver.Track().determinePayloadType(); err != nil {
-			pc.log.Warnf("Could not determine PayloadType for SSRC %d", receiver.Track().SSRC())
-			return
-		}
-
-		params, err := pc.api.mediaEngine.getRTPParametersByPayloadType(receiver.Track().PayloadType())
+		b := make([]byte, receiveMTU)
+		n, _, err := receiver.Track().peek(b)
 		if err != nil {
-			pc.log.Warnf("no codec could be found for payloadType %d", receiver.Track().PayloadType())
+			pc.log.Warnf("Could not determine PayloadType for SSRC %d (%s)", receiver.Track().SSRC(), err)
 			return
 		}
 
-		receiver.Track().mu.Lock()
-		receiver.Track().kind = receiver.kind
-		receiver.Track().codec = params.Codecs[0]
-		receiver.Track().params = params
-		receiver.Track().mu.Unlock()
+		if err = receiver.Track().checkAndUpdateTrack(b[:n]); err != nil {
+			pc.log.Warnf("Failed to set codec settings for track SSRC %d (%s)", receiver.Track().SSRC(), err)
+			return
+		}
 
 		pc.onTrack(receiver.Track(), receiver)
 	}()
@@ -1257,7 +1258,7 @@ func (pc *PeerConnection) startRTPReceivers(incomingTracks []trackDetails, curre
 
 	if remoteIsPlanB {
 		for _, incoming := range unhandledTracks {
-			t, err := pc.AddTransceiverFromKind(incoming.kind, RtpTransceiverInit{
+			t, err := pc.AddTransceiverFromKind(incoming.kind, RTPTransceiverInit{
 				Direction: RTPTransceiverDirectionSendrecv,
 			})
 			if err != nil {
@@ -1273,16 +1274,7 @@ func (pc *PeerConnection) startRTPReceivers(incomingTracks []trackDetails, curre
 func (pc *PeerConnection) startRTPSenders(currentTransceivers []*RTPTransceiver) error {
 	for _, transceiver := range currentTransceivers {
 		if transceiver.Sender() != nil && transceiver.Sender().isNegotiated() && !transceiver.Sender().hasSent() {
-			err := transceiver.Sender().Send(RTPSendParameters{
-				Encodings: []RTPEncodingParameters{
-					{
-						RTPCodingParameters{
-							SSRC:        transceiver.Sender().ssrc,
-							PayloadType: transceiver.Sender().payloadType,
-						},
-					},
-				},
-			})
+			err := transceiver.Sender().Send(transceiver.Sender().GetParameters())
 			if err != nil {
 				return err
 			}
@@ -1352,7 +1344,7 @@ func (pc *PeerConnection) handleUndeclaredSSRC(rtpStream io.Reader, ssrc SSRC) e
 			incoming.kind = RTPCodecTypeAudio
 		}
 
-		t, err := pc.AddTransceiverFromKind(incoming.kind, RtpTransceiverInit{
+		t, err := pc.AddTransceiverFromKind(incoming.kind, RTPTransceiverInit{
 			Direction: RTPTransceiverDirectionSendrecv,
 		})
 		if err != nil {
@@ -1520,18 +1512,14 @@ func (pc *PeerConnection) AddICECandidate(candidate ICECandidateInit) error {
 // ICEConnectionState returns the ICE connection state of the
 // PeerConnection instance.
 func (pc *PeerConnection) ICEConnectionState() ICEConnectionState {
-	pc.mu.RLock()
-	defer pc.mu.RUnlock()
-
-	return pc.iceConnectionState
+	return pc.iceConnectionState.Load().(ICEConnectionState)
 }
 
 // GetSenders returns the RTPSender that are currently attached to this PeerConnection
-func (pc *PeerConnection) GetSenders() []*RTPSender {
+func (pc *PeerConnection) GetSenders() (result []*RTPSender) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 
-	result := []*RTPSender{}
 	for _, transceiver := range pc.rtpTransceivers {
 		if transceiver.Sender() != nil {
 			result = append(result, transceiver.Sender())
@@ -1567,67 +1555,85 @@ func (pc *PeerConnection) AddTrack(track TrackLocal) (*RTPSender, error) {
 		return nil, &rtcerr.InvalidStateError{Err: ErrConnectionClosed}
 	}
 
-	var transceiver *RTPTransceiver
-	for _, t := range pc.GetTransceivers() {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	for _, t := range pc.rtpTransceivers {
 		if !t.stopped && t.kind == track.Kind() && t.Sender() == nil {
-			transceiver = t
-			break
+			sender, err := pc.api.NewRTPSender(track, pc.dtlsTransport)
+			if err == nil {
+				err = t.SetSender(sender, track)
+				if err != nil {
+					_ = sender.Stop()
+					t.setSender(nil)
+				}
+			}
+			if err != nil {
+				return nil, err
+			}
+			pc.onNegotiationNeeded()
+			return sender, nil
 		}
 	}
-	if transceiver != nil {
-		sender, err := pc.api.NewRTPSender(track, pc.dtlsTransport)
-		if err != nil {
-			return nil, err
-		}
-		transceiver.setSender(sender)
-		// we still need to call setSendingTrack to ensure direction has changed
-		if err := transceiver.setSendingTrack(track); err != nil {
-			return nil, err
-		}
-		pc.onNegotiationNeeded()
 
-		return sender, nil
-	}
-
-	transceiver, err := pc.AddTransceiverFromTrack(track)
+	transceiver, err := pc.newTransceiverFromTrack(RTPTransceiverDirectionSendrecv, track)
 	if err != nil {
 		return nil, err
 	}
-
+	pc.addRTPTransceiver(transceiver)
 	return transceiver.Sender(), nil
 }
 
 // RemoveTrack removes a Track from the PeerConnection
-func (pc *PeerConnection) RemoveTrack(sender *RTPSender) error {
+func (pc *PeerConnection) RemoveTrack(sender *RTPSender) (err error) {
 	if pc.isClosed.get() {
 		return &rtcerr.InvalidStateError{Err: ErrConnectionClosed}
 	}
 
 	var transceiver *RTPTransceiver
-	for _, t := range pc.GetTransceivers() {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	for _, t := range pc.rtpTransceivers {
 		if t.Sender() == sender {
 			transceiver = t
 			break
 		}
 	}
-
 	if transceiver == nil {
 		return &rtcerr.InvalidAccessError{Err: ErrSenderNotCreatedByConnection}
-	} else if err := sender.Stop(); err != nil {
-		return err
+	} else if err = sender.Stop(); err == nil {
+		err = transceiver.setSendingTrack(nil)
+		if err == nil {
+			pc.onNegotiationNeeded()
+		}
 	}
-
-	if err := transceiver.setSendingTrack(nil); err != nil {
-		return err
-	}
-
-	pc.onNegotiationNeeded()
-
-	return nil
+	return
 }
 
-// AddTransceiverFromKind Create a new RtpTransceiver(SendRecv or RecvOnly) and add it to the set of transceivers.
-func (pc *PeerConnection) AddTransceiverFromKind(kind RTPCodecType, init ...RtpTransceiverInit) (*RTPTransceiver, error) {
+func (pc *PeerConnection) newTransceiverFromTrack(direction RTPTransceiverDirection, track TrackLocal) (t *RTPTransceiver, err error) {
+	var (
+		r *RTPReceiver
+		s *RTPSender
+	)
+	switch direction {
+	case RTPTransceiverDirectionSendrecv:
+		r, err = pc.api.NewRTPReceiver(track.Kind(), pc.dtlsTransport)
+		if err != nil {
+			return
+		}
+		s, err = pc.api.NewRTPSender(track, pc.dtlsTransport)
+	case RTPTransceiverDirectionSendonly:
+		s, err = pc.api.NewRTPSender(track, pc.dtlsTransport)
+	default:
+		err = errPeerConnAddTransceiverFromTrackSupport
+	}
+	if err != nil {
+		return
+	}
+	return newRTPTransceiver(r, s, direction, track.Kind(), pc.api), nil
+}
+
+// AddTransceiverFromKind Create a new RtpTransceiver and adds it to the set of transceivers.
+func (pc *PeerConnection) AddTransceiverFromKind(kind RTPCodecType, init ...RTPTransceiverInit) (t *RTPTransceiver, err error) {
 	if pc.isClosed.get() {
 		return nil, &rtcerr.InvalidStateError{Err: ErrConnectionClosed}
 	}
@@ -1638,43 +1644,37 @@ func (pc *PeerConnection) AddTransceiverFromKind(kind RTPCodecType, init ...RtpT
 	} else if len(init) == 1 {
 		direction = init[0].Direction
 	}
-
 	switch direction {
-	case RTPTransceiverDirectionSendrecv:
+	case RTPTransceiverDirectionSendonly, RTPTransceiverDirectionSendrecv:
 		codecs := pc.api.mediaEngine.getCodecsByKind(kind)
 		if len(codecs) == 0 {
 			return nil, ErrNoCodecsAvailable
 		}
-
 		track, err := NewTrackLocalStaticSample(codecs[0].RTPCodecCapability, util.MathRandAlpha(16), util.MathRandAlpha(16))
 		if err != nil {
 			return nil, err
 		}
-
-		return pc.AddTransceiverFromTrack(track, init...)
+		t, err = pc.newTransceiverFromTrack(direction, track)
+		if err != nil {
+			return nil, err
+		}
 	case RTPTransceiverDirectionRecvonly:
 		receiver, err := pc.api.NewRTPReceiver(kind, pc.dtlsTransport)
 		if err != nil {
 			return nil, err
 		}
-
-		t := pc.newRTPTransceiver(
-			receiver,
-			nil,
-			RTPTransceiverDirectionRecvonly,
-			kind,
-		)
-
-		pc.onNegotiationNeeded()
-
-		return t, nil
+		t = newRTPTransceiver(receiver, nil, RTPTransceiverDirectionRecvonly, kind, pc.api)
 	default:
 		return nil, errPeerConnAddTransceiverFromKindSupport
 	}
+	pc.mu.Lock()
+	pc.addRTPTransceiver(t)
+	pc.mu.Unlock()
+	return t, nil
 }
 
 // AddTransceiverFromTrack Create a new RtpTransceiver(SendRecv or SendOnly) and add it to the set of transceivers.
-func (pc *PeerConnection) AddTransceiverFromTrack(track TrackLocal, init ...RtpTransceiverInit) (*RTPTransceiver, error) {
+func (pc *PeerConnection) AddTransceiverFromTrack(track TrackLocal, init ...RTPTransceiverInit) (t *RTPTransceiver, err error) {
 	if pc.isClosed.get() {
 		return nil, &rtcerr.InvalidStateError{Err: ErrConnectionClosed}
 	}
@@ -1686,48 +1686,13 @@ func (pc *PeerConnection) AddTransceiverFromTrack(track TrackLocal, init ...RtpT
 		direction = init[0].Direction
 	}
 
-	switch direction {
-	case RTPTransceiverDirectionSendrecv:
-		receiver, err := pc.api.NewRTPReceiver(track.Kind(), pc.dtlsTransport)
-		if err != nil {
-			return nil, err
-		}
-
-		sender, err := pc.api.NewRTPSender(track, pc.dtlsTransport)
-		if err != nil {
-			return nil, err
-		}
-
-		t := pc.newRTPTransceiver(
-			receiver,
-			sender,
-			RTPTransceiverDirectionSendrecv,
-			track.Kind(),
-		)
-
-		pc.onNegotiationNeeded()
-
-		return t, nil
-
-	case RTPTransceiverDirectionSendonly:
-		sender, err := pc.api.NewRTPSender(track, pc.dtlsTransport)
-		if err != nil {
-			return nil, err
-		}
-
-		t := pc.newRTPTransceiver(
-			nil,
-			sender,
-			RTPTransceiverDirectionSendonly,
-			track.Kind(),
-		)
-
-		pc.onNegotiationNeeded()
-
-		return t, nil
-	default:
-		return nil, errPeerConnAddTransceiverFromTrackSupport
+	t, err = pc.newTransceiverFromTrack(direction, track)
+	if err == nil {
+		pc.mu.Lock()
+		pc.addRTPTransceiver(t)
+		pc.mu.Unlock()
 	}
+	return
 }
 
 // CreateDataChannel creates a new DataChannel object with the given label
@@ -1805,7 +1770,9 @@ func (pc *PeerConnection) CreateDataChannel(label string, options *DataChannelIn
 		}
 	}
 
+	pc.mu.Lock()
 	pc.onNegotiationNeeded()
+	pc.mu.Unlock()
 
 	return d, nil
 }
@@ -1823,25 +1790,7 @@ func (pc *PeerConnection) WriteRTCP(pkts []rtcp.Packet) error {
 }
 
 func (pc *PeerConnection) writeRTCP(pkts []rtcp.Packet, _ interceptor.Attributes) (int, error) {
-	raw, err := rtcp.Marshal(pkts)
-	if err != nil {
-		return 0, err
-	}
-
-	srtcpSession, err := pc.dtlsTransport.getSRTCPSession()
-	if err != nil {
-		return 0, nil
-	}
-
-	writeStream, err := srtcpSession.OpenWriteStream()
-	if err != nil {
-		return 0, fmt.Errorf("%w: %v", errPeerConnWriteRTCPOpenWriteStream, err)
-	}
-
-	if n, err := writeStream.Write(raw); err != nil {
-		return n, err
-	}
-	return 0, nil
+	return pc.dtlsTransport.WriteRTCP(pkts)
 }
 
 // Close ends the PeerConnection
@@ -1868,11 +1817,13 @@ func (pc *PeerConnection) Close() error {
 	closeErrs = append(closeErrs, pc.api.interceptor.Close())
 
 	// https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-close (step #4)
-	for _, t := range pc.GetTransceivers() {
+	pc.mu.Lock()
+	for _, t := range pc.rtpTransceivers {
 		if !t.stopped {
 			closeErrs = append(closeErrs, t.Stop())
 		}
 	}
+	pc.mu.Unlock()
 
 	// https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-close (step #5)
 	pc.sctpTransport.lock.Lock()
@@ -1900,22 +1851,12 @@ func (pc *PeerConnection) Close() error {
 	return util.FlattenErrs(closeErrs)
 }
 
-func (pc *PeerConnection) newRTPTransceiver(
-	receiver *RTPReceiver,
-	sender *RTPSender,
-	direction RTPTransceiverDirection,
-	kind RTPCodecType,
-) *RTPTransceiver {
-	t := &RTPTransceiver{kind: kind}
-	t.setReceiver(receiver)
-	t.setSender(sender)
-	t.setDirection(direction)
-
-	pc.mu.Lock()
+// addRTPTransceiver appends t into rtpTransceivers
+// and fires onNegotiationNeeded;
+// caller of this method should hold `pc.mu` lock
+func (pc *PeerConnection) addRTPTransceiver(t *RTPTransceiver) {
 	pc.rtpTransceivers = append(pc.rtpTransceivers, t)
-	pc.mu.Unlock()
-
-	return t
+	pc.onNegotiationNeeded()
 }
 
 // CurrentLocalDescription represents the local description that was
@@ -1924,8 +1865,11 @@ func (pc *PeerConnection) newRTPTransceiver(
 // by the ICEAgent since the offer or answer was created.
 func (pc *PeerConnection) CurrentLocalDescription() *SessionDescription {
 	pc.mu.Lock()
-	defer pc.mu.Unlock()
-	return populateLocalCandidates(pc.currentLocalDescription, pc.iceGatherer, pc.ICEGatheringState())
+	localDescription := pc.currentLocalDescription
+	iceGather := pc.iceGatherer
+	iceGatheringState := pc.ICEGatheringState()
+	pc.mu.Unlock()
+	return populateLocalCandidates(localDescription, iceGather, iceGatheringState)
 }
 
 // PendingLocalDescription represents a local description that is in the
@@ -1934,8 +1878,11 @@ func (pc *PeerConnection) CurrentLocalDescription() *SessionDescription {
 // PeerConnection is in the stable state, the value is null.
 func (pc *PeerConnection) PendingLocalDescription() *SessionDescription {
 	pc.mu.Lock()
-	defer pc.mu.Unlock()
-	return populateLocalCandidates(pc.pendingLocalDescription, pc.iceGatherer, pc.ICEGatheringState())
+	localDescription := pc.pendingLocalDescription
+	iceGather := pc.iceGatherer
+	iceGatheringState := pc.ICEGatheringState()
+	pc.mu.Unlock()
+	return populateLocalCandidates(localDescription, iceGather, iceGatheringState)
 }
 
 // CurrentRemoteDescription represents the last remote description that was
@@ -1943,6 +1890,9 @@ func (pc *PeerConnection) PendingLocalDescription() *SessionDescription {
 // into the stable state plus any remote candidates that have been supplied
 // via AddICECandidate() since the offer or answer was created.
 func (pc *PeerConnection) CurrentRemoteDescription() *SessionDescription {
+	pc.mu.RLock()
+	defer pc.mu.RUnlock()
+
 	return pc.currentRemoteDescription
 }
 
@@ -1952,6 +1902,9 @@ func (pc *PeerConnection) CurrentRemoteDescription() *SessionDescription {
 // created. If the PeerConnection is in the stable state, the value is
 // null.
 func (pc *PeerConnection) PendingRemoteDescription() *SessionDescription {
+	pc.mu.RLock()
+	defer pc.mu.RUnlock()
+
 	return pc.pendingRemoteDescription
 }
 
@@ -1981,10 +1934,7 @@ func (pc *PeerConnection) ICEGatheringState() ICEGatheringState {
 // ConnectionState attribute returns the connection state of the
 // PeerConnection instance.
 func (pc *PeerConnection) ConnectionState() PeerConnectionState {
-	pc.mu.Lock()
-	defer pc.mu.Unlock()
-
-	return pc.connectionState
+	return pc.connectionState.Load().(PeerConnectionState)
 }
 
 // GetStats return data providing statistics about the overall connection
@@ -2212,12 +2162,15 @@ func (pc *PeerConnection) generateMatchedSDP(transceivers []*RTPTransceiver, use
 	}
 
 	var t *RTPTransceiver
+	remoteDescription := pc.currentRemoteDescription
+	if pc.pendingRemoteDescription != nil {
+		remoteDescription = pc.pendingRemoteDescription
+	}
 	localTransceivers := append([]*RTPTransceiver{}, transceivers...)
-	detectedPlanB := descriptionIsPlanB(pc.RemoteDescription())
+	detectedPlanB := descriptionIsPlanB(remoteDescription)
 	mediaSections := []mediaSection{}
 	alreadyHaveApplicationMediaSection := false
-
-	for _, media := range pc.RemoteDescription().parsed.MediaDescriptions {
+	for _, media := range remoteDescription.parsed.MediaDescriptions {
 		midValue := getMidValue(media)
 		if midValue == "" {
 			return nil, errPeerConnRemoteDescriptionWithoutMidValue
@@ -2250,7 +2203,7 @@ func (pc *PeerConnection) generateMatchedSDP(transceivers []*RTPTransceiver, use
 				t, localTransceivers = satisfyTypeAndDirection(kind, direction, localTransceivers)
 				if t == nil {
 					if len(mediaTransceivers) == 0 {
-						t = &RTPTransceiver{kind: kind}
+						t = &RTPTransceiver{kind: kind, api: pc.api, codecs: pc.api.mediaEngine.getCodecsByKind(kind)}
 						t.setDirection(RTPTransceiverDirectionInactive)
 						mediaTransceivers = append(mediaTransceivers, t)
 					}
