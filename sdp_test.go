@@ -204,7 +204,7 @@ func TestTrackDetailsFromSDP(t *testing.T) {
 					},
 					Attributes: []sdp.Attribute{
 						{Key: "sendonly"},
-						{Key: "rid", Value: "f send pt=97;max-width=1280;max-height=720"},
+						{Key: sdpAttributeRid, Value: "f send pt=97;max-width=1280;max-height=720"},
 					},
 				},
 			},
@@ -219,14 +219,14 @@ func TestTrackDetailsFromSDP(t *testing.T) {
 			assert.Fail(t, "missing audio track with ssrc:2000")
 		} else {
 			assert.Equal(t, RTPCodecTypeAudio, track.kind)
-			assert.Equal(t, SSRC(2000), track.ssrc)
+			assert.Equal(t, SSRC(2000), track.ssrcs[0])
 			assert.Equal(t, "audio_trk_label", track.streamID)
 		}
 		if track := trackDetailsForSSRC(tracks, 3000); track == nil {
 			assert.Fail(t, "missing video track with ssrc:3000")
 		} else {
 			assert.Equal(t, RTPCodecTypeVideo, track.kind)
-			assert.Equal(t, SSRC(3000), track.ssrc)
+			assert.Equal(t, SSRC(3000), track.ssrcs[0])
 			assert.Equal(t, "video_trk_label", track.streamID)
 		}
 		if track := trackDetailsForSSRC(tracks, 4000); track != nil {
@@ -236,7 +236,7 @@ func TestTrackDetailsFromSDP(t *testing.T) {
 			assert.Fail(t, "missing video track with ssrc:5000")
 		} else {
 			assert.Equal(t, RTPCodecTypeVideo, track.kind)
-			assert.Equal(t, SSRC(5000), track.ssrc)
+			assert.Equal(t, SSRC(5000), track.ssrcs[0])
 			assert.Equal(t, "video_trk_id", track.id)
 			assert.Equal(t, "video_stream_id", track.streamID)
 		}
@@ -368,15 +368,14 @@ func TestMediaDescriptionFingerprints(t *testing.T) {
 }
 
 func TestPopulateSDP(t *testing.T) {
-	t.Run("Rid", func(t *testing.T) {
+	t.Run("rid", func(t *testing.T) {
 		se := SettingEngine{}
 
 		me := &MediaEngine{}
 		assert.NoError(t, me.RegisterDefaultCodecs())
 		api := NewAPI(WithMediaEngine(me))
 
-		tr := &RTPTransceiver{kind: RTPCodecTypeVideo, api: api, codecs: me.videoCodecs}
-		tr.setDirection(RTPTransceiverDirectionRecvonly)
+		tr := newRTPTransceiver(nil, nil, RTPTransceiverDirectionRecvonly, RTPCodecTypeVideo, api)
 		ridMap := map[string]string{
 			"ridkey": "some",
 		}
@@ -394,7 +393,7 @@ func TestPopulateSDP(t *testing.T) {
 				continue
 			}
 			for _, a := range desc.Attributes {
-				if a.Key == "rid" {
+				if a.Key == sdpAttributeRid {
 					if strings.Contains(a.Value, "ridkey") {
 						found = true
 						break
@@ -458,7 +457,7 @@ func TestGetRIDs(t *testing.T) {
 			},
 			Attributes: []sdp.Attribute{
 				{Key: "sendonly"},
-				{Key: "rid", Value: "f send pt=97;max-width=1280;max-height=720"},
+				{Key: sdpAttributeRid, Value: "f send pt=97;max-width=1280;max-height=720"},
 			},
 		},
 	}
