@@ -1,3 +1,4 @@
+//go:build !js
 // +build !js
 
 package webrtc
@@ -326,6 +327,10 @@ func (t *DTLSTransport) Start(remoteParameters DTLSParameters) error {
 		dtlsConfig.ReplayProtectionWindow = int(*t.api.settingEngine.replayProtection.DTLS)
 	}
 
+	if t.api.settingEngine.dtls.retransmissionInterval != 0 {
+		dtlsConfig.FlightInterval = t.api.settingEngine.dtls.retransmissionInterval
+	}
+
 	// Connect as DTLS Client/Server, function is blocking and we
 	// must not hold the DTLSTransport lock
 	if role == DTLSRoleClient {
@@ -359,10 +364,6 @@ func (t *DTLSTransport) Start(remoteParameters DTLSParameters) error {
 		return ErrNoSRTPProtectionProfile
 	}
 
-	if t.api.settingEngine.disableCertificateFingerprintVerification {
-		return nil
-	}
-
 	// Check the fingerprint if a certificate was exchanged
 	remoteCerts := dtlsConn.ConnectionState().PeerCertificates
 	if len(remoteCerts) == 0 {
@@ -371,23 +372,25 @@ func (t *DTLSTransport) Start(remoteParameters DTLSParameters) error {
 	}
 	t.remoteCertificate = remoteCerts[0]
 
-	parsedRemoteCert, err := x509.ParseCertificate(t.remoteCertificate)
-	if err != nil {
-		if closeErr := dtlsConn.Close(); closeErr != nil {
-			t.log.Error(err.Error())
+	if !t.api.settingEngine.disableCertificateFingerprintVerification {
+		parsedRemoteCert, err := x509.ParseCertificate(t.remoteCertificate)
+		if err != nil {
+			if closeErr := dtlsConn.Close(); closeErr != nil {
+				t.log.Error(err.Error())
+			}
+
+			t.onStateChange(DTLSTransportStateFailed)
+			return err
 		}
 
-		t.onStateChange(DTLSTransportStateFailed)
-		return err
-	}
+		if err = t.validateFingerPrint(parsedRemoteCert); err != nil {
+			if closeErr := dtlsConn.Close(); closeErr != nil {
+				t.log.Error(err.Error())
+			}
 
-	if err = t.validateFingerPrint(parsedRemoteCert); err != nil {
-		if closeErr := dtlsConn.Close(); closeErr != nil {
-			t.log.Error(err.Error())
+			t.onStateChange(DTLSTransportStateFailed)
+			return err
 		}
-
-		t.onStateChange(DTLSTransportStateFailed)
-		return err
 	}
 
 	t.conn = dtlsConn
@@ -447,7 +450,7 @@ func (t *DTLSTransport) validateFingerPrint(remoteCert *x509.Certificate) error 
 }
 
 func (t *DTLSTransport) ensureICEConn() error {
-	if t.iceTransport == nil || t.iceTransport.State() == ICETransportStateNew {
+	if t.iceTransport == nil {
 		return errICEConnectionNotStarted
 	}
 

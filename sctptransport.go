@@ -1,3 +1,4 @@
+//go:build !js
 // +build !js
 
 package webrtc
@@ -110,10 +111,26 @@ func (r *SCTPTransport) Start(remoteCaps SCTPCapabilities) error {
 	}
 
 	r.lock.Lock()
-	defer r.lock.Unlock()
-
 	r.sctpAssociation = sctpAssociation
 	r.state = SCTPTransportStateConnected
+	dataChannels := append([]*DataChannel{}, r.dataChannels...)
+	r.lock.Unlock()
+
+	var openedDCCount uint32
+	for _, d := range dataChannels {
+		if d.ReadyState() == DataChannelStateConnecting {
+			err := d.open(r)
+			if err != nil {
+				r.log.Warnf("failed to open data channel: %s", err)
+				continue
+			}
+			openedDCCount++
+		}
+	}
+
+	r.lock.Lock()
+	r.dataChannelsOpened += openedDCCount
+	r.lock.Unlock()
 
 	go r.acceptDataChannels(sctpAssociation)
 
@@ -139,16 +156,34 @@ func (r *SCTPTransport) Stop() error {
 }
 
 func (r *SCTPTransport) acceptDataChannels(a *sctp.Association) {
+	r.lock.RLock()
+	dataChannels := make([]*datachannel.DataChannel, 0, len(r.dataChannels))
+	for _, dc := range r.dataChannels {
+		dc.mu.Lock()
+		isNil := dc.dataChannel == nil
+		dc.mu.Unlock()
+		if isNil {
+			continue
+		}
+		dataChannels = append(dataChannels, dc.dataChannel)
+	}
+	r.lock.RUnlock()
+ACCEPT:
 	for {
 		dc, err := datachannel.Accept(a, &datachannel.Config{
 			LoggerFactory: r.api.settingEngine.LoggerFactory,
-		})
+		}, dataChannels...)
 		if err != nil {
 			if err != io.EOF {
 				r.log.Errorf("Failed to accept data channel: %v", err)
 				r.onError(err)
 			}
 			return
+		}
+		for _, ch := range dataChannels {
+			if ch.StreamIdentifier() == dc.StreamIdentifier() {
+				continue ACCEPT
+			}
 		}
 
 		var (
@@ -195,7 +230,7 @@ func (r *SCTPTransport) acceptDataChannels(a *sctp.Association) {
 		}
 
 		<-r.onDataChannel(rtcDC)
-		rtcDC.handleOpen(dc)
+		rtcDC.handleOpen(dc, true, dc.Config.Negotiated)
 
 		r.lock.Lock()
 		r.dataChannelsOpened++
@@ -351,11 +386,11 @@ func (r *SCTPTransport) generateAndSetDataChannelID(dtlsRole DTLSRole, idOut **u
 	// Create map of ids so we can compare without double-looping each time.
 	idsMap := make(map[uint16]struct{}, len(r.dataChannels))
 	for _, dc := range r.dataChannels {
-		if dc.id == nil {
+		if dc.ID() == nil {
 			continue
 		}
 
-		idsMap[*dc.id] = struct{}{}
+		idsMap[*dc.ID()] = struct{}{}
 	}
 
 	for ; id < max-1; id += 2 {

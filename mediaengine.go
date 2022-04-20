@@ -1,3 +1,4 @@
+//go:build !js
 // +build !js
 
 package webrtc
@@ -19,6 +20,9 @@ const (
 	// MimeTypeH264 H264 MIME type.
 	// Note: Matching should be case insensitive.
 	MimeTypeH264 = "video/H264"
+	// MimeTypeH265 H265 MIME type
+	// Note: Matching should be case insensitive.
+	MimeTypeH265 = "video/H265"
 	// MimeTypeOpus Opus MIME type
 	// Note: Matching should be case insensitive.
 	MimeTypeOpus = "audio/opus"
@@ -28,6 +32,9 @@ const (
 	// MimeTypeVP9 VP9 MIME type
 	// Note: Matching should be case insensitive.
 	MimeTypeVP9 = "video/VP9"
+	// MimeTypeAV1 AV1 MIME type
+	// Note: Matching should be case insensitive.
+	MimeTypeAV1 = "video/AV1"
 	// MimeTypeG722 G722 MIME type
 	// Note: Matching should be case insensitive.
 	MimeTypeG722 = "audio/G722"
@@ -313,27 +320,39 @@ func (m *MediaEngine) copy() *MediaEngine {
 	return cloned
 }
 
+func findCodecByPayload(codecs []RTPCodecParameters, payloadType PayloadType) *RTPCodecParameters {
+	for _, codec := range codecs {
+		if codec.PayloadType == payloadType {
+			return &codec
+		}
+	}
+	return nil
+}
+
 func (m *MediaEngine) getCodecByPayload(payloadType PayloadType) (RTPCodecParameters, RTPCodecType, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	codecs := m.negotiatedVideoCodecs
-	if !m.negotiatedVideo {
-		codecs = m.videoCodecs
-	}
-	for _, codec := range codecs {
-		if codec.PayloadType == payloadType {
-			return codec, RTPCodecTypeVideo, nil
+	// if we've negotiated audio or video, check the negotiated types before our
+	// built-in payload types, to ensure we pick the codec the other side wants.
+	if m.negotiatedVideo {
+		if codec := findCodecByPayload(m.negotiatedVideoCodecs, payloadType); codec != nil {
+			return *codec, RTPCodecTypeVideo, nil
 		}
 	}
-
-	codecs = m.negotiatedAudioCodecs
-	if !m.negotiatedAudio {
-		codecs = m.audioCodecs
+	if m.negotiatedAudio {
+		if codec := findCodecByPayload(m.negotiatedAudioCodecs, payloadType); codec != nil {
+			return *codec, RTPCodecTypeAudio, nil
+		}
 	}
-	for _, codec := range codecs {
-		if codec.PayloadType == payloadType {
-			return codec, RTPCodecTypeAudio, nil
+	if !m.negotiatedVideo {
+		if codec := findCodecByPayload(m.videoCodecs, payloadType); codec != nil {
+			return *codec, RTPCodecTypeVideo, nil
+		}
+	}
+	if !m.negotiatedAudio {
+		if codec := findCodecByPayload(m.audioCodecs, payloadType); codec != nil {
+			return *codec, RTPCodecTypeAudio, nil
 		}
 	}
 
@@ -535,11 +554,13 @@ func (m *MediaEngine) getCodecsByKind(typ RTPCodecType) []RTPCodecParameters {
 }
 
 func (m *MediaEngine) getRTPParametersByKind(typ RTPCodecType, directions []RTPTransceiverDirection) RTPParameters {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	headerExtensions := make([]RTPHeaderExtensionParameter, 0)
 
+	// perform before locking to prevent recursive RLocks
+	foundCodecs := m.getCodecsByKind(typ)
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if m.negotiatedVideo && typ == RTPCodecTypeVideo ||
 		m.negotiatedAudio && typ == RTPCodecTypeAudio {
 		for id, e := range m.negotiatedHeaderExtensions {
@@ -557,7 +578,7 @@ func (m *MediaEngine) getRTPParametersByKind(typ RTPCodecType, directions []RTPT
 
 	return RTPParameters{
 		HeaderExtensions: headerExtensions,
-		Codecs:           m.getCodecsByKind(typ),
+		Codecs:           foundCodecs,
 	}
 }
 
@@ -594,6 +615,8 @@ func payloaderForCodec(codec RTPCodecCapability) (rtp.Payloader, error) {
 		}, nil
 	case strings.ToLower(MimeTypeVP9):
 		return &codecs.VP9Payloader{}, nil
+	case strings.ToLower(MimeTypeAV1):
+		return &codecs.AV1Payloader{}, nil
 	case strings.ToLower(MimeTypeG722):
 		return &codecs.G722Payloader{}, nil
 	case strings.ToLower(MimeTypePCMU), strings.ToLower(MimeTypePCMA):

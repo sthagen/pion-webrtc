@@ -1,3 +1,4 @@
+//go:build !js
 // +build !js
 
 package webrtc
@@ -18,6 +19,7 @@ import (
 	"github.com/pion/randutil"
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
+	"github.com/pion/sdp/v3"
 	"github.com/pion/transport/test"
 	"github.com/pion/webrtc/v3/pkg/media"
 	"github.com/stretchr/testify/assert"
@@ -29,6 +31,18 @@ var (
 	errIncomingTrackLabelInvalid = errors.New("incoming Track Label is invalid")
 	errNoTransceiverwithMid      = errors.New("no transceiver with mid")
 )
+
+func registerSimulcastHeaderExtensions(m *MediaEngine, codecType RTPCodecType) {
+	for _, extension := range []string{
+		sdp.SDESMidURI,
+		sdp.SDESRTPStreamIDURI,
+		sdesRepairRTPStreamIDURI,
+	} {
+		if err := m.RegisterHeaderExtension(RTPHeaderExtensionCapability{URI: extension}, codecType); err != nil {
+			panic(err)
+		}
+	}
+}
 
 /*
 Integration test for bi-directional peers
@@ -129,6 +143,9 @@ func TestPeerConnection_Media_Sample(t *testing.T) {
 	go func() {
 		for {
 			time.Sleep(time.Millisecond * 100)
+			if pcOffer.ICEConnectionState() != ICEConnectionStateConnected {
+				continue
+			}
 			if routineErr := vp8Track.WriteSample(media.Sample{Data: []byte{0x00}, Duration: time.Second}); routineErr != nil {
 				fmt.Println(routineErr)
 			}
@@ -145,7 +162,7 @@ func TestPeerConnection_Media_Sample(t *testing.T) {
 	go func() {
 		for {
 			time.Sleep(time.Millisecond * 100)
-			if routineErr := pcOffer.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{SenderSSRC: uint32(sender.ssrc), MediaSSRC: uint32(sender.ssrc)}}); routineErr != nil {
+			if routineErr := pcOffer.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{SenderSSRC: uint32(sender.trackEncodings[0].ssrc), MediaSSRC: uint32(sender.trackEncodings[0].ssrc)}}); routineErr != nil {
 				awaitRTCPSenderSend <- routineErr
 			}
 
@@ -626,12 +643,12 @@ func TestAddTransceiverAddTrack_Reuse(t *testing.T) {
 	track1, sender1 := addTrack()
 	assert.Equal(t, 1, len(pc.GetTransceivers()))
 	assert.Equal(t, sender1, tr.Sender())
-	assert.Equal(t, track1, tr.Sender().track)
+	assert.Equal(t, track1, tr.Sender().Track())
 	require.NoError(t, pc.RemoveTrack(sender1))
 
 	track2, _ := addTrack()
 	assert.Equal(t, 1, len(pc.GetTransceivers()))
-	assert.Equal(t, track2, tr.Sender().track)
+	assert.Equal(t, track2, tr.Sender().Track())
 
 	addTrack()
 	assert.Equal(t, 2, len(pc.GetTransceivers()))
@@ -963,8 +980,6 @@ func TestPeerConnection_Start_Right_Receiver(t *testing.T) {
 	closePairNow(t, pcOffer, pcAnswer)
 }
 
-// Assert that failed Simulcast probing doesn't cause
-// the handleUndeclaredSSRC to be leaked
 func TestPeerConnection_Simulcast_Probe(t *testing.T) {
 	lim := test.TimeOut(time.Second * 30) //nolint
 	defer lim.Stop()
@@ -972,53 +987,153 @@ func TestPeerConnection_Simulcast_Probe(t *testing.T) {
 	report := test.CheckRoutines(t)
 	defer report()
 
-	track, err := NewTrackLocalStaticRTP(RTPCodecCapability{MimeType: MimeTypeVP8}, "video", "pion")
-	assert.NoError(t, err)
+	// Assert that failed Simulcast probing doesn't cause
+	// the handleUndeclaredSSRC to be leaked
+	t.Run("Leak", func(t *testing.T) {
+		track, err := NewTrackLocalStaticRTP(RTPCodecCapability{MimeType: MimeTypeVP8}, "video", "pion")
+		assert.NoError(t, err)
 
-	offerer, answerer, err := newPair()
-	assert.NoError(t, err)
+		offerer, answerer, err := newPair()
+		assert.NoError(t, err)
 
-	_, err = offerer.AddTrack(track)
-	assert.NoError(t, err)
+		_, err = offerer.AddTrack(track)
+		assert.NoError(t, err)
 
-	ticker := time.NewTicker(time.Millisecond * 20)
-	testFinished := make(chan struct{})
-	seenFiveStreams, seenFiveStreamsCancel := context.WithCancel(context.Background())
+		ticker := time.NewTicker(time.Millisecond * 20)
+		testFinished := make(chan struct{})
+		seenFiveStreams, seenFiveStreamsCancel := context.WithCancel(context.Background())
 
-	go func() {
-		for {
-			select {
-			case <-testFinished:
-				return
-			case <-ticker.C:
-				answerer.dtlsTransport.lock.Lock()
-				if len(answerer.dtlsTransport.simulcastStreams) >= 5 {
-					seenFiveStreamsCancel()
+		go func() {
+			for {
+				select {
+				case <-testFinished:
+					return
+				case <-ticker.C:
+					answerer.dtlsTransport.lock.Lock()
+					if len(answerer.dtlsTransport.simulcastStreams) >= 5 {
+						seenFiveStreamsCancel()
+					}
+					answerer.dtlsTransport.lock.Unlock()
+
+					track.mu.Lock()
+					if len(track.bindings) == 1 {
+						_, err = track.bindings[0].writeStream.WriteRTP(&rtp.Header{
+							Version: 2,
+							SSRC:    randutil.NewMathRandomGenerator().Uint32(),
+						}, []byte{0, 1, 2, 3, 4, 5})
+						assert.NoError(t, err)
+					}
+					track.mu.Unlock()
 				}
-				answerer.dtlsTransport.lock.Unlock()
-
-				track.mu.Lock()
-				if len(track.bindings) == 1 {
-					_, err = track.bindings[0].writeStream.WriteRTP(&rtp.Header{
-						Version: 2,
-						SSRC:    randutil.NewMathRandomGenerator().Uint32(),
-					}, []byte{0, 1, 2, 3, 4, 5})
-					assert.NoError(t, err)
-				}
-				track.mu.Unlock()
 			}
+		}()
+
+		assert.NoError(t, signalPair(offerer, answerer))
+
+		peerConnectionConnected := untilConnectionState(PeerConnectionStateConnected, offerer, answerer)
+		peerConnectionConnected.Wait()
+
+		<-seenFiveStreams.Done()
+
+		closePairNow(t, offerer, answerer)
+		close(testFinished)
+	})
+
+	// Assert that NonSimulcast Traffic isn't incorrectly broken by the probe
+	t.Run("Break NonSimulcast", func(t *testing.T) {
+		unhandledSimulcastError := make(chan struct{})
+
+		m := &MediaEngine{}
+		if err := m.RegisterDefaultCodecs(); err != nil {
+			panic(err)
 		}
-	}()
+		registerSimulcastHeaderExtensions(m, RTPCodecTypeVideo)
 
-	assert.NoError(t, signalPair(offerer, answerer))
+		pcOffer, pcAnswer, err := NewAPI(WithSettingEngine(SettingEngine{
+			LoggerFactory: &undeclaredSsrcLoggerFactory{unhandledSimulcastError},
+		}), WithMediaEngine(m)).newPair(Configuration{})
+		assert.NoError(t, err)
 
-	peerConnectionConnected := untilConnectionState(PeerConnectionStateConnected, offerer, answerer)
-	peerConnectionConnected.Wait()
+		firstTrack, err := NewTrackLocalStaticRTP(RTPCodecCapability{MimeType: MimeTypeVP8}, "firstTrack", "firstTrack")
+		assert.NoError(t, err)
 
-	<-seenFiveStreams.Done()
+		_, err = pcOffer.AddTrack(firstTrack)
+		assert.NoError(t, err)
 
-	closePairNow(t, offerer, answerer)
-	close(testFinished)
+		secondTrack, err := NewTrackLocalStaticRTP(RTPCodecCapability{MimeType: MimeTypeVP8}, "secondTrack", "secondTrack")
+		assert.NoError(t, err)
+
+		_, err = pcOffer.AddTrack(secondTrack)
+		assert.NoError(t, err)
+
+		assert.NoError(t, signalPairWithModification(pcOffer, pcAnswer, func(sessionDescription string) (filtered string) {
+			shouldDiscard := false
+
+			scanner := bufio.NewScanner(strings.NewReader(sessionDescription))
+			for scanner.Scan() {
+				if strings.HasPrefix(scanner.Text(), "m=video") {
+					shouldDiscard = !shouldDiscard
+				}
+
+				if !shouldDiscard {
+					filtered += scanner.Text() + "\r\n"
+				}
+			}
+
+			return
+		}))
+
+		sequenceNumber := uint16(0)
+		sendRTPPacket := func() {
+			sequenceNumber++
+			assert.NoError(t, firstTrack.WriteRTP(&rtp.Packet{
+				Header: rtp.Header{
+					Version:        2,
+					SequenceNumber: sequenceNumber,
+				},
+				Payload: []byte{0x00},
+			}))
+			time.Sleep(20 * time.Millisecond)
+		}
+
+		for ; sequenceNumber <= 5; sequenceNumber++ {
+			sendRTPPacket()
+		}
+
+		assert.NoError(t, signalPair(pcOffer, pcAnswer))
+
+		trackRemoteChan := make(chan *TrackRemote, 1)
+		pcAnswer.OnTrack(func(trackRemote *TrackRemote, _ *RTPReceiver) {
+			trackRemoteChan <- trackRemote
+		})
+
+		trackRemote := func() *TrackRemote {
+			for {
+				select {
+				case t := <-trackRemoteChan:
+					return t
+				default:
+					sendRTPPacket()
+				}
+			}
+		}()
+
+		func() {
+			for {
+				select {
+				case <-unhandledSimulcastError:
+					return
+				default:
+					sendRTPPacket()
+				}
+			}
+		}()
+
+		_, _, err = trackRemote.Read(make([]byte, 1500))
+		assert.NoError(t, err)
+
+		closePairNow(t, pcOffer, pcAnswer)
+	})
 }
 
 // Assert that CreateOffer returns an error for a RTPSender with no codecs
@@ -1111,15 +1226,7 @@ func TestPeerConnection_Simulcast(t *testing.T) {
 	if err := m.RegisterDefaultCodecs(); err != nil {
 		panic(err)
 	}
-	for _, extension := range []string{
-		"urn:ietf:params:rtp-hdrext:sdes:mid",
-		"urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id",
-		"urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id",
-	} {
-		if err := m.RegisterHeaderExtension(RTPHeaderExtensionCapability{URI: extension}, RTPCodecTypeVideo); err != nil {
-			panic(err)
-		}
-	}
+	registerSimulcastHeaderExtensions(m, RTPCodecTypeVideo)
 
 	assertRidCorrect := func(t *testing.T) {
 		ridMapLock.Lock()
@@ -1149,23 +1256,47 @@ func TestPeerConnection_Simulcast(t *testing.T) {
 		pcOffer, pcAnswer, err := NewAPI(WithMediaEngine(m)).newPair(Configuration{})
 		assert.NoError(t, err)
 
-		vp8Writer, err := NewTrackLocalStaticRTP(RTPCodecCapability{MimeType: MimeTypeVP8}, "video", "pion2")
+		vp8WriterA, err := NewTrackLocalStaticRTP(RTPCodecCapability{MimeType: MimeTypeVP8}, "video", "pion2", WithRTPStreamID("a"))
 		assert.NoError(t, err)
 
-		_, err = pcOffer.AddTrack(vp8Writer)
+		sender, err := pcOffer.AddTrack(vp8WriterA)
+		assert.NoError(t, err)
+		assert.NotNil(t, sender)
+
+		vp8WriterB, err := NewTrackLocalStaticRTP(RTPCodecCapability{MimeType: MimeTypeVP8}, "video", "pion2", WithRTPStreamID("b"))
+		assert.NoError(t, err)
+		err = sender.AddEncoding(vp8WriterB)
+		assert.NoError(t, err)
+
+		vp8WriterC, err := NewTrackLocalStaticRTP(RTPCodecCapability{MimeType: MimeTypeVP8}, "video", "pion2", WithRTPStreamID("c"))
+		assert.NoError(t, err)
+		err = sender.AddEncoding(vp8WriterC)
 		assert.NoError(t, err)
 
 		ridMap = map[string]int{}
 		pcAnswer.OnTrack(onTrackHandler)
 
-		assert.NoError(t, signalPairWithModification(pcOffer, pcAnswer, func(sessionDescription string) string {
-			sessionDescription = strings.Split(sessionDescription, "a=end-of-candidates\r\n")[0]
-			sessionDescription = filterSsrc(sessionDescription)
-			for _, rid := range rids {
-				sessionDescription += "a=" + sdpAttributeRid + ":" + rid + " send\r\n"
+		parameters := sender.GetParameters()
+		assert.Equal(t, "a", parameters.Encodings[0].RID)
+		assert.Equal(t, "b", parameters.Encodings[1].RID)
+		assert.Equal(t, "c", parameters.Encodings[2].RID)
+
+		var midID, ridID, rsidID uint8
+		for _, extension := range parameters.HeaderExtensions {
+			switch extension.URI {
+			case sdp.SDESMidURI:
+				midID = uint8(extension.ID)
+			case sdp.SDESRTPStreamIDURI:
+				ridID = uint8(extension.ID)
+			case sdesRepairRTPStreamIDURI:
+				rsidID = uint8(extension.ID)
 			}
-			return sessionDescription + "a=simulcast:send " + strings.Join(rids, ";") + "\r\n"
-		}))
+		}
+		assert.NotZero(t, midID)
+		assert.NotZero(t, ridID)
+		assert.NotZero(t, rsidID)
+
+		assert.NoError(t, signalPair(pcOffer, pcAnswer))
 
 		for sequenceNumber := uint16(0); !ridsFullfilled(); sequenceNumber++ {
 			time.Sleep(20 * time.Millisecond)
@@ -1177,71 +1308,26 @@ func TestPeerConnection_Simulcast(t *testing.T) {
 					SequenceNumber: sequenceNumber,
 					PayloadType:    96,
 				}
-				assert.NoError(t, header.SetExtension(1, []byte("0")))
+				assert.NoError(t, header.SetExtension(midID, []byte("0")))
 
 				// Send RSID for first 10 packets
 				if sequenceNumber >= 10 {
-					assert.NoError(t, header.SetExtension(2, []byte(rid)))
+					assert.NoError(t, header.SetExtension(ridID, []byte(rid)))
 				} else {
-					assert.NoError(t, header.SetExtension(3, []byte(rid)))
+					assert.NoError(t, header.SetExtension(rsidID, []byte(rid)))
 					header.SSRC += 10
 				}
 
-				_, err := vp8Writer.bindings[0].writeStream.WriteRTP(header, []byte{0x00})
-				assert.NoError(t, err)
-			}
-		}
-
-		assertRidCorrect(t)
-		closePairNow(t, pcOffer, pcAnswer)
-	})
-
-	t.Run("SSRC Based", func(t *testing.T) {
-		pcOffer, pcAnswer, err := NewAPI(WithMediaEngine(m)).newPair(Configuration{})
-		assert.NoError(t, err)
-
-		vp8Writer, err := NewTrackLocalStaticRTP(RTPCodecCapability{MimeType: MimeTypeVP8}, "video", "pion2")
-		assert.NoError(t, err)
-
-		_, err = pcOffer.AddTrack(vp8Writer)
-		assert.NoError(t, err)
-
-		ridMap = map[string]int{}
-		pcAnswer.OnTrack(onTrackHandler)
-
-		assert.NoError(t, signalPairWithModification(pcOffer, pcAnswer, func(sessionDescription string) string {
-			sessionDescription = strings.Split(sessionDescription, "a=end-of-candidates\r\n")[0]
-			sessionDescription = filterSsrc(sessionDescription)
-
-			for _, rid := range rids {
-				sessionDescription += "a=" + sdpAttributeRid + ":" + rid + " send\r\n"
-			}
-			sessionDescription += "a=simulcast:send " + strings.Join(rids, ";") + "\r\n"
-
-			return sessionDescription + `a=ssrc:5000 cname:{49d59adc-fae6-407b-8850-2eb4a5e9b76e}
-a=ssrc:5001 cname:{49d59adc-fae6-407b-8850-2eb4a5e9b76e}
-a=ssrc:5002 cname:{49d59adc-fae6-407b-8850-2eb4a5e9b76e}
-a=ssrc:5003 cname:{49d59adc-fae6-407b-8850-2eb4a5e9b76e}
-a=ssrc:5004 cname:{49d59adc-fae6-407b-8850-2eb4a5e9b76e}
-a=ssrc:5005 cname:{49d59adc-fae6-407b-8850-2eb4a5e9b76e}
-a=ssrc-group:FID 5000 5001
-a=ssrc-group:FID 5002 5003
-a=ssrc-group:FID 5004 5005
-`
-		}))
-
-		for sequenceNumber := uint16(0); !ridsFullfilled(); sequenceNumber++ {
-			time.Sleep(20 * time.Millisecond)
-
-			for ssrc := 5000; ssrc <= 5004; ssrc += 2 {
-				header := &rtp.Header{
-					Version:        2,
-					SSRC:           uint32(ssrc),
-					SequenceNumber: sequenceNumber,
-					PayloadType:    96,
+				var writer *TrackLocalStaticRTP
+				switch rid {
+				case "a":
+					writer = vp8WriterA
+				case "b":
+					writer = vp8WriterB
+				case "c":
+					writer = vp8WriterC
 				}
-
-				_, err := vp8Writer.bindings[0].writeStream.WriteRTP(header, []byte{0x00})
+				_, err = writer.bindings[0].writeStream.WriteRTP(header, []byte{0x00})
 				assert.NoError(t, err)
 			}
 		}

@@ -1,3 +1,4 @@
+//go:build !js
 // +build !js
 
 package webrtc
@@ -178,7 +179,7 @@ func TestPeerConnection_SetConfiguration_Go(t *testing.T) {
 	certificate2, err := GenerateCertificate(secretKey2)
 	assert.Nil(t, err)
 
-	for _, testcase := range []struct {
+	for _, test := range []struct {
 		name    string
 		init    func() (*PeerConnection, error)
 		config  Configuration
@@ -266,14 +267,14 @@ func TestPeerConnection_SetConfiguration_Go(t *testing.T) {
 			wantErr: &rtcerr.InvalidAccessError{Err: ErrNoTurnCredentials},
 		},
 	} {
-		pc, err := testcase.init()
+		pc, err := test.init()
 		if err != nil {
-			t.Errorf("SetConfiguration %q: init failed: %v", testcase.name, err)
+			t.Errorf("SetConfiguration %q: init failed: %v", test.name, err)
 		}
 
-		err = pc.SetConfiguration(testcase.config)
-		if got, want := err, testcase.wantErr; !reflect.DeepEqual(got, want) {
-			t.Errorf("SetConfiguration %q: err = %v, want %v", testcase.name, got, want)
+		err = pc.SetConfiguration(test.config)
+		if got, want := err, test.wantErr; !reflect.DeepEqual(got, want) {
+			t.Errorf("SetConfiguration %q: err = %v, want %v", test.name, got, want)
 		}
 
 		assert.NoError(t, pc.Close())
@@ -446,7 +447,14 @@ func TestPeerConnection_AnswerWithClosedConnection(t *testing.T) {
 }
 
 func TestPeerConnection_satisfyTypeAndDirection(t *testing.T) {
-	for _, testcase := range []struct {
+	createTransceiver := func(kind RTPCodecType, direction RTPTransceiverDirection) *RTPTransceiver {
+		r := &RTPTransceiver{kind: kind}
+		r.setDirection(direction)
+
+		return r
+	}
+
+	for _, test := range []struct {
 		name string
 
 		kinds      []RTPCodecType
@@ -459,7 +467,7 @@ func TestPeerConnection_satisfyTypeAndDirection(t *testing.T) {
 			"Audio and Video Transceivers can not satisfy each other",
 			[]RTPCodecType{RTPCodecTypeVideo},
 			[]RTPTransceiverDirection{RTPTransceiverDirectionSendrecv},
-			[]*RTPTransceiver{newRTPTransceiver(nil, nil, RTPTransceiverDirectionSendrecv, RTPCodecTypeAudio, nil)},
+			[]*RTPTransceiver{createTransceiver(RTPCodecTypeAudio, RTPTransceiverDirectionSendrecv)},
 			[]*RTPTransceiver{nil},
 		},
 		{
@@ -481,9 +489,9 @@ func TestPeerConnection_satisfyTypeAndDirection(t *testing.T) {
 			[]RTPCodecType{RTPCodecTypeVideo},
 			[]RTPTransceiverDirection{RTPTransceiverDirectionSendrecv},
 
-			[]*RTPTransceiver{newRTPTransceiver(nil, nil, RTPTransceiverDirectionRecvonly, RTPCodecTypeVideo, nil)},
+			[]*RTPTransceiver{createTransceiver(RTPCodecTypeVideo, RTPTransceiverDirectionRecvonly)},
 
-			[]*RTPTransceiver{newRTPTransceiver(nil, nil, RTPTransceiverDirectionRecvonly, RTPCodecTypeVideo, nil)},
+			[]*RTPTransceiver{createTransceiver(RTPCodecTypeVideo, RTPTransceiverDirectionRecvonly)},
 		},
 		{
 			"Don't satisfy a Sendonly with a SendRecv, later SendRecv will be marked as Inactive",
@@ -491,39 +499,39 @@ func TestPeerConnection_satisfyTypeAndDirection(t *testing.T) {
 			[]RTPTransceiverDirection{RTPTransceiverDirectionSendonly, RTPTransceiverDirectionSendrecv},
 
 			[]*RTPTransceiver{
-				newRTPTransceiver(nil, nil, RTPTransceiverDirectionSendrecv, RTPCodecTypeVideo, nil),
-				newRTPTransceiver(nil, nil, RTPTransceiverDirectionRecvonly, RTPCodecTypeVideo, nil),
+				createTransceiver(RTPCodecTypeVideo, RTPTransceiverDirectionSendrecv),
+				createTransceiver(RTPCodecTypeVideo, RTPTransceiverDirectionRecvonly),
 			},
 
 			[]*RTPTransceiver{
-				newRTPTransceiver(nil, nil, RTPTransceiverDirectionRecvonly, RTPCodecTypeVideo, nil),
-				newRTPTransceiver(nil, nil, RTPTransceiverDirectionSendrecv, RTPCodecTypeVideo, nil),
+				createTransceiver(RTPCodecTypeVideo, RTPTransceiverDirectionRecvonly),
+				createTransceiver(RTPCodecTypeVideo, RTPTransceiverDirectionSendrecv),
 			},
 		},
 	} {
-		if len(testcase.kinds) != len(testcase.directions) {
+		if len(test.kinds) != len(test.directions) {
 			t.Fatal("Kinds and Directions must be the same length")
 		}
 
 		got := []*RTPTransceiver{}
-		for i := range testcase.kinds {
-			res, filteredLocalTransceivers := satisfyTypeAndDirection(testcase.kinds[i], testcase.directions[i], testcase.localTransceivers)
+		for i := range test.kinds {
+			res, filteredLocalTransceivers := satisfyTypeAndDirection(test.kinds[i], test.directions[i], test.localTransceivers)
 
 			got = append(got, res)
-			testcase.localTransceivers = filteredLocalTransceivers
+			test.localTransceivers = filteredLocalTransceivers
 		}
 
-		if !reflect.DeepEqual(got, testcase.want) {
+		if !reflect.DeepEqual(got, test.want) {
 			gotStr := ""
 			for _, t := range got {
 				gotStr += fmt.Sprintf("%+v\n", t)
 			}
 
 			wantStr := ""
-			for _, t := range testcase.want {
+			for _, t := range test.want {
 				wantStr += fmt.Sprintf("%+v\n", t)
 			}
-			t.Errorf("satisfyTypeAndDirection %q: \ngot\n%s \nwant\n%s", testcase.name, gotStr, wantStr)
+			t.Errorf("satisfyTypeAndDirection %q: \ngot\n%s \nwant\n%s", test.name, gotStr, wantStr)
 		}
 	}
 }
@@ -555,80 +563,52 @@ func TestOneAttrKeyConnectionSetupPerMediaDescriptionInSDP(t *testing.T) {
 	assert.NoError(t, pc.Close())
 }
 
-func TestPeerConnection_OfferingLite(t *testing.T) {
+func TestPeerConnection_IceLite(t *testing.T) {
 	report := test.CheckRoutines(t)
 	defer report()
 
 	lim := test.TimeOut(time.Second * 10)
 	defer lim.Stop()
 
-	s := SettingEngine{}
-	s.SetLite(true)
-	offerPC, err := NewAPI(WithSettingEngine(s)).NewPeerConnection(Configuration{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	answerPC, err := NewAPI().NewPeerConnection(Configuration{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err = signalPair(offerPC, answerPC); err != nil {
-		t.Fatal(err)
-	}
-
-	iceComplete := make(chan interface{})
-	answerPC.OnICEConnectionStateChange(func(iceState ICEConnectionState) {
-		if iceState == ICEConnectionStateConnected {
-			select {
-			case <-iceComplete:
-			default:
-				close(iceComplete)
-			}
+	connectTwoAgents := func(offerIsLite, answerisLite bool) {
+		offerSettingEngine := SettingEngine{}
+		offerSettingEngine.SetLite(offerIsLite)
+		offerPC, err := NewAPI(WithSettingEngine(offerSettingEngine)).NewPeerConnection(Configuration{})
+		if err != nil {
+			t.Fatal(err)
 		}
+
+		answerSettingEngine := SettingEngine{}
+		answerSettingEngine.SetLite(answerisLite)
+		answerPC, err := NewAPI(WithSettingEngine(answerSettingEngine)).NewPeerConnection(Configuration{})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err = signalPair(offerPC, answerPC); err != nil {
+			t.Fatal(err)
+		}
+
+		dataChannelOpen := make(chan interface{})
+		answerPC.OnDataChannel(func(_ *DataChannel) {
+			close(dataChannelOpen)
+		})
+
+		<-dataChannelOpen
+		closePairNow(t, offerPC, answerPC)
+	}
+
+	t.Run("Offerer", func(t *testing.T) {
+		connectTwoAgents(true, false)
 	})
 
-	<-iceComplete
-	closePairNow(t, offerPC, answerPC)
-}
-
-func TestPeerConnection_AnsweringLite(t *testing.T) {
-	report := test.CheckRoutines(t)
-	defer report()
-
-	lim := test.TimeOut(time.Second * 10)
-	defer lim.Stop()
-
-	offerPC, err := NewAPI().NewPeerConnection(Configuration{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	s := SettingEngine{}
-	s.SetLite(true)
-	answerPC, err := NewAPI(WithSettingEngine(s)).NewPeerConnection(Configuration{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err = signalPair(offerPC, answerPC); err != nil {
-		t.Fatal(err)
-	}
-
-	iceComplete := make(chan interface{})
-	answerPC.OnICEConnectionStateChange(func(iceState ICEConnectionState) {
-		if iceState == ICEConnectionStateConnected {
-			select {
-			case <-iceComplete:
-			default:
-				close(iceComplete)
-			}
-		}
+	t.Run("Answerer", func(t *testing.T) {
+		connectTwoAgents(false, true)
 	})
 
-	<-iceComplete
-	closePairNow(t, offerPC, answerPC)
+	t.Run("Both", func(t *testing.T) {
+		connectTwoAgents(true, true)
+	})
 }
 
 func TestOnICEGatheringStateChange(t *testing.T) {
@@ -1215,7 +1195,7 @@ func TestICELite(t *testing.T) {
 
 	assert.NoError(t, peerConnection.SetLocalDescription(SDPAnswer))
 
-	assert.Equal(t, ICERoleControlling, peerConnection.iceTransport.role,
+	assert.Equal(t, ICERoleControlling, peerConnection.iceTransport.Role(),
 		"pion did not set state to ICE-CONTROLLED against ice-light offer")
 
 	assert.NoError(t, peerConnection.Close())
@@ -1251,7 +1231,7 @@ func TestPeerConnection_TransceiverDirection(t *testing.T) {
 		return err
 	}
 
-	for _, testcase := range []struct {
+	for _, test := range []struct {
 		name                  string
 		offerDirection        RTPTransceiverDirection
 		answerStartDirection  RTPTransceiverDirection
@@ -1312,11 +1292,11 @@ func TestPeerConnection_TransceiverDirection(t *testing.T) {
 			[]RTPTransceiverDirection{RTPTransceiverDirectionRecvonly, RTPTransceiverDirectionSendonly},
 		},
 	} {
-		offerDirection := testcase.offerDirection
-		answerStartDirection := testcase.answerStartDirection
-		answerFinalDirections := testcase.answerFinalDirections
+		offerDirection := test.offerDirection
+		answerStartDirection := test.answerStartDirection
+		answerFinalDirections := test.answerFinalDirections
 
-		t.Run(testcase.name, func(t *testing.T) {
+		t.Run(test.name, func(t *testing.T) {
 			pcOffer, pcAnswer, err := newPair()
 			assert.NoError(t, err)
 
@@ -1427,33 +1407,180 @@ func TestPeerConnectionNilCallback(t *testing.T) {
 	assert.NoError(t, pc.Close())
 }
 
-func TestPeerConnection_SkipStoppedTransceiver(t *testing.T) {
-	defer test.TimeOut(time.Second).Stop()
+func TestTransceiverCreatedByRemoteSdpHasSameCodecOrderAsRemote(t *testing.T) {
+	t.Run("Codec MatchExact", func(t *testing.T) { //nolint:dupl
+		const remoteSdp = `v=0
+o=- 4596489990601351948 2 IN IP4 127.0.0.1
+s=-
+t=0 0
+m=video 60323 UDP/TLS/RTP/SAVPF 98 94 106
+a=ice-ufrag:1/MvHwjAyVf27aLu
+a=ice-pwd:3dBU7cFOBl120v33cynDvN1E
+a=ice-options:google-ice
+a=fingerprint:sha-256 75:74:5A:A6:A4:E5:52:F4:A7:67:4C:01:C7:EE:91:3F:21:3D:A2:E3:53:7B:6F:30:86:F2:30:AA:65:FB:04:24
+a=mid:0
+a=rtpmap:98 H264/90000
+a=fmtp:98 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
+a=rtpmap:94 VP8/90000
+a=rtpmap:106 H264/90000
+a=fmtp:106 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f
+a=sendonly
+m=video 60323 UDP/TLS/RTP/SAVPF 108 98 125
+a=ice-ufrag:1/MvHwjAyVf27aLu
+a=ice-pwd:3dBU7cFOBl120v33cynDvN1E
+a=ice-options:google-ice
+a=fingerprint:sha-256 75:74:5A:A6:A4:E5:52:F4:A7:67:4C:01:C7:EE:91:3F:21:3D:A2:E3:53:7B:6F:30:86:F2:30:AA:65:FB:04:24
+a=mid:1
+a=rtpmap:98 H264/90000
+a=fmtp:98 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
+a=rtpmap:108 VP8/90000
+a=sendonly
+a=rtpmap:125 H264/90000
+a=fmtp:125 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f
+`
+		m := MediaEngine{}
+		assert.NoError(t, m.RegisterCodec(RTPCodecParameters{
+			RTPCodecCapability: RTPCodecCapability{MimeTypeVP8, 90000, 0, "", nil},
+			PayloadType:        94,
+		}, RTPCodecTypeVideo))
+		assert.NoError(t, m.RegisterCodec(RTPCodecParameters{
+			RTPCodecCapability: RTPCodecCapability{MimeTypeH264, 90000, 0, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f", nil},
+			PayloadType:        98,
+		}, RTPCodecTypeVideo))
 
-	pc, err := NewPeerConnection(Configuration{})
+		api := NewAPI(WithMediaEngine(&m))
+		pc, err := api.NewPeerConnection(Configuration{})
+		assert.NoError(t, err)
+		assert.NoError(t, pc.SetRemoteDescription(SessionDescription{
+			Type: SDPTypeOffer,
+			SDP:  remoteSdp,
+		}))
+		ans, _ := pc.CreateAnswer(nil)
+		assert.NoError(t, pc.SetLocalDescription(ans))
+		codecOfTr1 := pc.GetTransceivers()[0].getCodecs()[0]
+		codecs := pc.api.mediaEngine.getCodecsByKind(RTPCodecTypeVideo)
+		_, matchType := codecParametersFuzzySearch(codecOfTr1, codecs)
+		assert.Equal(t, codecMatchExact, matchType)
+		codecOfTr2 := pc.GetTransceivers()[1].getCodecs()[0]
+		_, matchType = codecParametersFuzzySearch(codecOfTr2, codecs)
+		assert.Equal(t, codecMatchExact, matchType)
+		assert.EqualValues(t, 94, codecOfTr2.PayloadType)
+		assert.NoError(t, pc.Close())
+	})
+
+	t.Run("Codec PartialExact Only", func(t *testing.T) { //nolint:dupl
+		const remoteSdp = `v=0
+o=- 4596489990601351948 2 IN IP4 127.0.0.1
+s=-
+t=0 0
+m=video 60323 UDP/TLS/RTP/SAVPF 98 106
+a=ice-ufrag:1/MvHwjAyVf27aLu
+a=ice-pwd:3dBU7cFOBl120v33cynDvN1E
+a=ice-options:google-ice
+a=fingerprint:sha-256 75:74:5A:A6:A4:E5:52:F4:A7:67:4C:01:C7:EE:91:3F:21:3D:A2:E3:53:7B:6F:30:86:F2:30:AA:65:FB:04:24
+a=mid:0
+a=rtpmap:98 H264/90000
+a=fmtp:98 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f
+a=rtpmap:106 H264/90000
+a=fmtp:106 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032
+a=sendonly
+m=video 60323 UDP/TLS/RTP/SAVPF 125 98
+a=ice-ufrag:1/MvHwjAyVf27aLu
+a=ice-pwd:3dBU7cFOBl120v33cynDvN1E
+a=ice-options:google-ice
+a=fingerprint:sha-256 75:74:5A:A6:A4:E5:52:F4:A7:67:4C:01:C7:EE:91:3F:21:3D:A2:E3:53:7B:6F:30:86:F2:30:AA:65:FB:04:24
+a=mid:1
+a=rtpmap:125 H264/90000
+a=fmtp:125 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032
+a=rtpmap:98 H264/90000
+a=fmtp:98 level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42e01f
+a=sendonly
+`
+		m := MediaEngine{}
+		assert.NoError(t, m.RegisterCodec(RTPCodecParameters{
+			RTPCodecCapability: RTPCodecCapability{MimeTypeVP8, 90000, 0, "", nil},
+			PayloadType:        94,
+		}, RTPCodecTypeVideo))
+		assert.NoError(t, m.RegisterCodec(RTPCodecParameters{
+			RTPCodecCapability: RTPCodecCapability{MimeTypeH264, 90000, 0, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f", nil},
+			PayloadType:        98,
+		}, RTPCodecTypeVideo))
+
+		api := NewAPI(WithMediaEngine(&m))
+		pc, err := api.NewPeerConnection(Configuration{})
+		assert.NoError(t, err)
+		assert.NoError(t, pc.SetRemoteDescription(SessionDescription{
+			Type: SDPTypeOffer,
+			SDP:  remoteSdp,
+		}))
+		ans, _ := pc.CreateAnswer(nil)
+		assert.NoError(t, pc.SetLocalDescription(ans))
+		codecOfTr1 := pc.GetTransceivers()[0].getCodecs()[0]
+		codecs := pc.api.mediaEngine.getCodecsByKind(RTPCodecTypeVideo)
+		_, matchType := codecParametersFuzzySearch(codecOfTr1, codecs)
+		assert.Equal(t, codecMatchExact, matchType)
+		codecOfTr2 := pc.GetTransceivers()[1].getCodecs()[0]
+		_, matchType = codecParametersFuzzySearch(codecOfTr2, codecs)
+		assert.Equal(t, codecMatchExact, matchType)
+		// h.264/profile-id=640032 should be remap to 106 as same as transceiver 1
+		assert.EqualValues(t, 106, codecOfTr2.PayloadType)
+		assert.NoError(t, pc.Close())
+	})
+}
+
+// Assert that remote candidates with an unknown transport are ignored and logged.
+// This allows us to accept SessionDescriptions with proprietary candidates
+// like `ssltcp`.
+func TestInvalidCandidateTransport(t *testing.T) {
+	const (
+		sslTCPCandidate = `candidate:1 1 ssltcp 1 127.0.0.1 443 typ host generation 0`
+		sslTCPOffer     = `v=0
+o=- 0 2 IN IP4 127.0.0.1
+s=-
+t=0 0
+a=msid-semantic: WMS
+m=application 9 DTLS/SCTP 5000
+c=IN IP4 0.0.0.0
+a=ice-ufrag:1/MvHwjAyVf27aLu
+a=ice-pwd:3dBU7cFOBl120v33cynDvN1E
+a=fingerprint:sha-256 75:74:5A:A6:A4:E5:52:F4:A7:67:4C:01:C7:EE:91:3F:21:3D:A2:E3:53:7B:6F:30:86:F2:30:AA:65:FB:04:24
+a=mid:0
+a=` + sslTCPCandidate + "\n"
+	)
+
+	peerConnection, err := NewPeerConnection(Configuration{})
 	assert.NoError(t, err)
 
-	track, err := NewTrackLocalStaticSample(RTPCodecCapability{MimeType: "video/vp8"}, "video1", "pion")
+	assert.NoError(t, peerConnection.SetRemoteDescription(SessionDescription{Type: SDPTypeOffer, SDP: sslTCPOffer}))
+	assert.NoError(t, peerConnection.AddICECandidate(ICECandidateInit{Candidate: sslTCPCandidate}))
+
+	assert.NoError(t, peerConnection.Close())
+}
+
+func TestOfferWithInactiveDirection(t *testing.T) {
+	const remoteSDP = `v=0
+o=- 4596489990601351948 2 IN IP4 127.0.0.1
+s=-
+t=0 0
+a=fingerprint:sha-256 F7:BF:B4:42:5B:44:C0:B9:49:70:6D:26:D7:3E:E6:08:B1:5B:25:2E:32:88:50:B6:3C:BE:4E:18:A7:2C:85:7C
+a=group:BUNDLE 0 1
+a=msid-semantic:WMS *
+m=video 9 UDP/TLS/RTP/SAVPF 97
+c=IN IP4 0.0.0.0
+a=inactive
+a=ice-pwd:05d682b2902af03db90d9a9a5f2f8d7f
+a=ice-ufrag:93cc7e4d
+a=mid:0
+a=rtpmap:97 H264/90000
+a=setup:actpass
+a=ssrc:1455629982 cname:{61fd3093-0326-4b12-8258-86bdc1fe677a}
+`
+
+	peerConnection, err := NewPeerConnection(Configuration{})
 	assert.NoError(t, err)
 
-	transceiver, err := pc.AddTransceiverFromTrack(track)
-	assert.NoError(t, err)
-	assert.Equal(t, 1, len(pc.GetTransceivers()))
-	assert.NoError(t, pc.RemoveTrack(transceiver.Sender()))
-	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			assert.NoError(t, transceiver.Stop())
-		}() // no error, no panic
-	}
-	wg.Wait()
-	track, err = NewTrackLocalStaticSample(RTPCodecCapability{MimeType: "video/vp8"}, "video2", "pion")
-	assert.NoError(t, err)
-	_, err = pc.AddTrack(track) // should not use the above stopped transceiver
-	assert.NoError(t, err)
-	assert.Equal(t, 2, len(pc.GetTransceivers()))
+	assert.NoError(t, peerConnection.SetRemoteDescription(SessionDescription{Type: SDPTypeOffer, SDP: remoteSDP}))
+	assert.Equal(t, RTPTransceiverDirectionInactive, peerConnection.rtpTransceivers[0].direction.Load().(RTPTransceiverDirection))
 
-	assert.NoError(t, pc.Close())
+	assert.NoError(t, peerConnection.Close())
 }

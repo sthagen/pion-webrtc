@@ -1,3 +1,4 @@
+//go:build !js
 // +build !js
 
 package main
@@ -142,7 +143,7 @@ func main() {
 		}()
 
 		go func() {
-			// Open a IVF file and start reading using our IVFReader
+			// Open a OGG file and start reading using our OGGReader
 			file, oggErr := os.Open(audioFileName)
 			if oggErr != nil {
 				panic(oggErr)

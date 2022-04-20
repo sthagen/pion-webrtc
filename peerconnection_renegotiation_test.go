@@ -1,8 +1,10 @@
+//go:build !js
 // +build !js
 
 package webrtc
 
 import (
+	"bufio"
 	"context"
 	"io"
 	"strconv"
@@ -369,7 +371,7 @@ func TestPeerConnection_Transceiver_Mid(t *testing.T) {
 	// Must have 3 media descriptions (2 video channels)
 	assert.Equal(t, len(offer.parsed.MediaDescriptions), 2)
 
-	assert.True(t, sdpMidHasSsrc(offer, "0", sender1.ssrc), "Expected mid %q with ssrc %d, offer.SDP: %s", "0", sender1.ssrc, offer.SDP)
+	assert.True(t, sdpMidHasSsrc(offer, "0", sender1.trackEncodings[0].ssrc), "Expected mid %q with ssrc %d, offer.SDP: %s", "0", sender1.trackEncodings[0].ssrc, offer.SDP)
 
 	// Remove first track, must keep same number of media
 	// descriptions and same track ssrc for mid 1 as previous
@@ -380,7 +382,7 @@ func TestPeerConnection_Transceiver_Mid(t *testing.T) {
 
 	assert.Equal(t, len(offer.parsed.MediaDescriptions), 2)
 
-	assert.True(t, sdpMidHasSsrc(offer, "1", sender2.ssrc), "Expected mid %q with ssrc %d, offer.SDP: %s", "1", sender2.ssrc, offer.SDP)
+	assert.True(t, sdpMidHasSsrc(offer, "1", sender2.trackEncodings[0].ssrc), "Expected mid %q with ssrc %d, offer.SDP: %s", "1", sender2.trackEncodings[0].ssrc, offer.SDP)
 
 	_, err = pcAnswer.CreateAnswer(nil)
 	assert.Equal(t, err, &rtcerr.InvalidStateError{Err: ErrIncorrectSignalingState})
@@ -400,8 +402,8 @@ func TestPeerConnection_Transceiver_Mid(t *testing.T) {
 	// We reuse the existing non-sending transceiver
 	assert.Equal(t, len(offer.parsed.MediaDescriptions), 2)
 
-	assert.True(t, sdpMidHasSsrc(offer, "0", sender3.ssrc), "Expected mid %q with ssrc %d, offer.sdp: %s", "0", sender3.ssrc, offer.SDP)
-	assert.True(t, sdpMidHasSsrc(offer, "1", sender2.ssrc), "Expected mid %q with ssrc %d, offer.sdp: %s", "1", sender2.ssrc, offer.SDP)
+	assert.True(t, sdpMidHasSsrc(offer, "0", sender3.trackEncodings[0].ssrc), "Expected mid %q with ssrc %d, offer.sdp: %s", "0", sender3.trackEncodings[0].ssrc, offer.SDP)
+	assert.True(t, sdpMidHasSsrc(offer, "1", sender2.trackEncodings[0].ssrc), "Expected mid %q with ssrc %d, offer.sdp: %s", "1", sender2.trackEncodings[0].ssrc, offer.SDP)
 
 	closePairNow(t, pcOffer, pcAnswer)
 }
@@ -1002,20 +1004,11 @@ func TestPeerConnection_Renegotiation_Simulcast(t *testing.T) {
 	report := test.CheckRoutines(t)
 	defer report()
 
-	// Enable Extension Headers needed for Simulcast
 	m := &MediaEngine{}
 	if err := m.RegisterDefaultCodecs(); err != nil {
 		panic(err)
 	}
-	for _, extension := range []string{
-		"urn:ietf:params:rtp-hdrext:sdes:mid",
-		"urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id",
-		"urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id",
-	} {
-		if err := m.RegisterHeaderExtension(RTPHeaderExtensionCapability{URI: extension}, RTPCodecTypeVideo); err != nil {
-			panic(err)
-		}
-	}
+	registerSimulcastHeaderExtensions(m, RTPCodecTypeVideo)
 
 	originalRids := []string{"a", "b", "c"}
 	signalWithRids := func(sessionDescription string, rids []string) string {
@@ -1134,6 +1127,16 @@ func TestPeerConnection_Renegotiation_Simulcast(t *testing.T) {
 
 		newRids := []string{"d", "e", "f"}
 		assert.NoError(t, signalPairWithModification(pcOffer, pcAnswer, func(sessionDescription string) string {
+			scanner := bufio.NewScanner(strings.NewReader(sessionDescription))
+			sessionDescription = ""
+			for scanner.Scan() {
+				l := scanner.Text()
+				if strings.HasPrefix(l, "a=rid") || strings.HasPrefix(l, "a=simulcast") {
+					continue
+				}
+
+				sessionDescription += l + "\n"
+			}
 			return signalWithRids(sessionDescription, newRids)
 		}))
 

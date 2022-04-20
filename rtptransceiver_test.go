@@ -1,3 +1,4 @@
+//go:build !js
 // +build !js
 
 package webrtc
@@ -124,7 +125,7 @@ func Test_RTPTransceiver_SetCodecPreferences_PayloadType(t *testing.T) {
 	assert.NoError(t, err)
 
 	// VP8 with proper PayloadType
-	assert.NotEqual(t, -1, strings.Index(answer.SDP, "a=rtpmap:96 VP8/90000"))
+	assert.NotEqual(t, -1, strings.Index(answer.SDP, "a=rtpmap:51 VP8/90000"))
 
 	// testCodec is ignored since offerer doesn't support
 	assert.Equal(t, -1, strings.Index(answer.SDP, "testCodec"))

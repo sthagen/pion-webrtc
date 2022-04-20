@@ -1,3 +1,4 @@
+//go:build !js
 // +build !js
 
 package webrtc
@@ -19,7 +20,7 @@ type RTPTransceiver struct {
 
 	codecs []RTPCodecParameters // User provided codecs via SetCodecPreferences
 
-	stopped atomicBool
+	stopped bool
 	kind    RTPCodecType
 
 	api *API
@@ -69,7 +70,10 @@ func (t *RTPTransceiver) getCodecs() []RTPCodecParameters {
 	filteredCodecs := []RTPCodecParameters{}
 	for _, codec := range t.codecs {
 		if c, matchType := codecParametersFuzzySearch(codec, mediaEngineCodecs); matchType != codecMatchNone {
-			filteredCodecs = append(filteredCodecs, c)
+			if codec.PayloadType == 0 {
+				codec.PayloadType = c.PayloadType
+			}
+			filteredCodecs = append(filteredCodecs, codec)
 		}
 	}
 
@@ -112,8 +116,8 @@ func (t *RTPTransceiver) Receiver() *RTPReceiver {
 	return nil
 }
 
-// setMid sets the RTPTransceiver's mid. If it was already set, will return an error.
-func (t *RTPTransceiver) setMid(mid string) error {
+// SetMid sets the RTPTransceiver's mid. If it was already set, will return an error.
+func (t *RTPTransceiver) SetMid(mid string) error {
 	if currentMid := t.Mid(); currentMid != "" {
 		return fmt.Errorf("%w: %s to %s", errRTPTransceiverCannotChangeMid, currentMid, mid)
 	}
@@ -141,25 +145,20 @@ func (t *RTPTransceiver) Direction() RTPTransceiverDirection {
 
 // Stop irreversibly stops the RTPTransceiver
 func (t *RTPTransceiver) Stop() error {
-	if t.stopped.compareAndSwap(false, true) {
-		if sender := t.Sender(); sender != nil {
-			if err := sender.Stop(); err != nil {
-				return err
-			}
-		}
-		if receiver := t.Receiver(); receiver != nil {
-			if err := receiver.Stop(); err != nil {
-				return err
-			}
-
-			t.setDirection(RTPTransceiverDirectionInactive)
+	if sender := t.Sender(); sender != nil {
+		if err := sender.Stop(); err != nil {
+			return err
 		}
 	}
+	if receiver := t.Receiver(); receiver != nil {
+		if err := receiver.Stop(); err != nil {
+			return err
+		}
+	}
+
+	t.setDirection(RTPTransceiverDirectionInactive)
 	return nil
 }
-
-// Stopped indicates whether or not RTPTransceiver has been stopped
-func (t *RTPTransceiver) Stopped() bool { return t.stopped.get() }
 
 func (t *RTPTransceiver) setReceiver(r *RTPReceiver) {
 	if r != nil {
