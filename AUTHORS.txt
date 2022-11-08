@@ -60,6 +60,7 @@ donotanswer <viktor.ferter@doclerholding.com>
 earle <aguilar@dm.ai>
 Egon Elbre <egonelbre@gmail.com>
 Eric Daniels <eric@erdaniels.com>
+Eric Fontaine <ericfontainejazz@gmail.com>
 feixiao <feixiao2020@sina.com>
 Forest Johnson <forest.n.johnson@gmail.com>
 frank <frank@huzhedeMacBook-Pro.local>
@@ -117,6 +118,7 @@ Michiel De Backker <38858977+backkem@users.noreply.github.com>
 Mike Coleman <mc@fivebats.com>
 Mindgamesnl <matsmoolhuizen@gmail.com>
 mission-liao <missionaryliao@gmail.com>
+mr-shitij <21.shitijagrawal@gmail.com>
 mxmCherry <mxmCherry@gmail.com>
 Nam V. Do <vannam12a7@gmail.com>
 Nick Mykins <nmykins@digitalocean.com>
@@ -163,6 +165,7 @@ Simone Gotti <simone.gotti@gmail.com>
 Slugalisk <slugalisk@gmail.com>
 soolaugust <soolaugust@gmail.com>
 spaceCh1mp <drimboat@gmail.com>
+stephanrotolante <stephanrotolante@gmail.com>
 Suhas Gaddam <suhas.g.2011@gmail.com>
 Suzuki Takeo <takeo@stko.info>
 sylba2050 <masataka.hisasue@optim.co.jp>
