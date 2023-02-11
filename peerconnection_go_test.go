@@ -21,8 +21,8 @@ import (
 
 	"github.com/pion/ice/v2"
 	"github.com/pion/rtp"
-	"github.com/pion/transport/test"
-	"github.com/pion/transport/vnet"
+	"github.com/pion/transport/v2/test"
+	"github.com/pion/transport/v2/vnet"
 	"github.com/pion/webrtc/v3/internal/util"
 	"github.com/pion/webrtc/v3/pkg/rtcerr"
 	"github.com/stretchr/testify/assert"
@@ -1247,7 +1247,7 @@ func TestPeerConnection_TransceiverDirection(t *testing.T) {
 			"offer sendonly answer sendrecv",
 			RTPTransceiverDirectionSendonly,
 			RTPTransceiverDirectionSendrecv,
-			[]RTPTransceiverDirection{RTPTransceiverDirectionSendrecv, RTPTransceiverDirectionRecvonly},
+			[]RTPTransceiverDirection{RTPTransceiverDirectionSendrecv},
 		},
 		{
 			"offer recvonly answer sendrecv",
@@ -1259,7 +1259,7 @@ func TestPeerConnection_TransceiverDirection(t *testing.T) {
 			"offer sendrecv answer sendonly",
 			RTPTransceiverDirectionSendrecv,
 			RTPTransceiverDirectionSendonly,
-			[]RTPTransceiverDirection{RTPTransceiverDirectionSendonly, RTPTransceiverDirectionRecvonly},
+			[]RTPTransceiverDirection{RTPTransceiverDirectionSendrecv},
 		},
 		{
 			"offer sendonly answer sendonly",
