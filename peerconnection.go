@@ -1486,6 +1486,8 @@ func (pc *PeerConnection) handleUndeclaredSSRC(ssrc SSRC, remoteDescription *Ses
 	onlyMediaSection := remoteDescription.parsed.MediaDescriptions[0]
 	streamID := ""
 	id := ""
+	hasRidAttribute := false
+	hasSSRCAttribute := false
 
 	for _, a := range onlyMediaSection.Attributes {
 		switch a.Key {
@@ -1495,10 +1497,16 @@ func (pc *PeerConnection) handleUndeclaredSSRC(ssrc SSRC, remoteDescription *Ses
 				id = split[1]
 			}
 		case sdp.AttrKeySSRC:
-			return false, errPeerConnSingleMediaSectionHasExplicitSSRC
+			hasSSRCAttribute = true
 		case sdpAttributeRid:
-			return false, nil
+			hasRidAttribute = true
 		}
+	}
+
+	if hasRidAttribute {
+		return false, nil
+	} else if hasSSRCAttribute {
+		return false, errPeerConnSingleMediaSectionHasExplicitSSRC
 	}
 
 	incoming := trackDetails{
@@ -1983,7 +1991,7 @@ func (pc *PeerConnection) CreateDataChannel(label string, options *DataChannelIn
 		}
 	}
 
-	d, err := pc.api.newDataChannel(params, pc.log)
+	d, err := pc.api.newDataChannel(params, nil, pc.log)
 	if err != nil {
 		return nil, err
 	}
