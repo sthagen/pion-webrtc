@@ -19,14 +19,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/pion/ice/v2"
+	"github.com/pion/ice/v3"
 	"github.com/pion/interceptor"
 	"github.com/pion/logging"
 	"github.com/pion/rtcp"
 	"github.com/pion/sdp/v3"
-	"github.com/pion/srtp/v2"
-	"github.com/pion/webrtc/v3/internal/util"
-	"github.com/pion/webrtc/v3/pkg/rtcerr"
+	"github.com/pion/srtp/v3"
+	"github.com/pion/webrtc/v4/internal/util"
+	"github.com/pion/webrtc/v4/pkg/rtcerr"
 )
 
 // PeerConnection represents a WebRTC connection that establishes a
@@ -225,11 +225,11 @@ func (pc *PeerConnection) initConfiguration(configuration Configuration) error {
 		pc.configuration.Certificates = []Certificate{*certificate}
 	}
 
-	if configuration.BundlePolicy != BundlePolicy(Unknown) {
+	if configuration.BundlePolicy != BundlePolicyUnknown {
 		pc.configuration.BundlePolicy = configuration.BundlePolicy
 	}
 
-	if configuration.RTCPMuxPolicy != RTCPMuxPolicy(Unknown) {
+	if configuration.RTCPMuxPolicy != RTCPMuxPolicyUnknown {
 		pc.configuration.RTCPMuxPolicy = configuration.RTCPMuxPolicy
 	}
 
@@ -237,13 +237,8 @@ func (pc *PeerConnection) initConfiguration(configuration Configuration) error {
 		pc.configuration.ICECandidatePoolSize = configuration.ICECandidatePoolSize
 	}
 
-	if configuration.ICETransportPolicy != ICETransportPolicy(Unknown) {
-		pc.configuration.ICETransportPolicy = configuration.ICETransportPolicy
-	}
-
-	if configuration.SDPSemantics != SDPSemantics(Unknown) {
-		pc.configuration.SDPSemantics = configuration.SDPSemantics
-	}
+	pc.configuration.ICETransportPolicy = configuration.ICETransportPolicy
+	pc.configuration.SDPSemantics = configuration.SDPSemantics
 
 	sanitizedICEServers := configuration.getICEServers()
 	if len(sanitizedICEServers) > 0 {
@@ -400,6 +395,14 @@ func (pc *PeerConnection) checkNegotiationNeeded() bool { //nolint:gocognit
 					return true
 				}
 				track := sender.Track()
+				if track == nil {
+					// Situation when sender's track is nil could happen when
+					// a) replaceTrack(nil) is called
+					// b) removeTrack() is called, changing the transceiver's direction to inactive
+					// As t.Direction() in this branch is either sendrecv or sendonly, we believe (a) option is the case
+					// As calling replaceTrack does not require renegotiation, we skip check for this transceiver
+					continue
+				}
 				if !okMsid || descMsid != track.StreamID()+" "+track.ID() {
 					return true
 				}
@@ -446,8 +449,18 @@ func (pc *PeerConnection) OnICECandidate(f func(*ICECandidate)) {
 
 // OnICEGatheringStateChange sets an event handler which is invoked when the
 // ICE candidate gathering state has changed.
-func (pc *PeerConnection) OnICEGatheringStateChange(f func(ICEGathererState)) {
-	pc.iceGatherer.OnStateChange(f)
+func (pc *PeerConnection) OnICEGatheringStateChange(f func(ICEGatheringState)) {
+	pc.iceGatherer.OnStateChange(
+		func(gathererState ICEGathererState) {
+			switch gathererState {
+			case ICEGathererStateGathering:
+				f(ICEGatheringStateGathering)
+			case ICEGathererStateComplete:
+				f(ICEGatheringStateComplete)
+			default:
+				// Other states ignored
+			}
+		})
 }
 
 // OnTrack sets an event handler which is called when remote track
@@ -531,7 +544,7 @@ func (pc *PeerConnection) SetConfiguration(configuration Configuration) error { 
 	}
 
 	// https://www.w3.org/TR/webrtc/#set-the-configuration (step #5)
-	if configuration.BundlePolicy != BundlePolicy(Unknown) {
+	if configuration.BundlePolicy != BundlePolicyUnknown {
 		if configuration.BundlePolicy != pc.configuration.BundlePolicy {
 			return &rtcerr.InvalidModificationError{Err: ErrModifyingBundlePolicy}
 		}
@@ -539,7 +552,7 @@ func (pc *PeerConnection) SetConfiguration(configuration Configuration) error { 
 	}
 
 	// https://www.w3.org/TR/webrtc/#set-the-configuration (step #6)
-	if configuration.RTCPMuxPolicy != RTCPMuxPolicy(Unknown) {
+	if configuration.RTCPMuxPolicy != RTCPMuxPolicyUnknown {
 		if configuration.RTCPMuxPolicy != pc.configuration.RTCPMuxPolicy {
 			return &rtcerr.InvalidModificationError{Err: ErrModifyingRTCPMuxPolicy}
 		}
@@ -556,9 +569,7 @@ func (pc *PeerConnection) SetConfiguration(configuration Configuration) error { 
 	}
 
 	// https://www.w3.org/TR/webrtc/#set-the-configuration (step #8)
-	if configuration.ICETransportPolicy != ICETransportPolicy(Unknown) {
-		pc.configuration.ICETransportPolicy = configuration.ICETransportPolicy
-	}
+	pc.configuration.ICETransportPolicy = configuration.ICETransportPolicy
 
 	// https://www.w3.org/TR/webrtc/#set-the-configuration (step #11)
 	if len(configuration.ICEServers) > 0 {
@@ -861,7 +872,7 @@ func (pc *PeerConnection) setDescription(sd *SessionDescription, op stateChangeO
 	switch {
 	case pc.isClosed.get():
 		return &rtcerr.InvalidStateError{Err: ErrConnectionClosed}
-	case NewSDPType(sd.Type.String()) == SDPType(Unknown):
+	case NewSDPType(sd.Type.String()) == SDPTypeUnknown:
 		return &rtcerr.TypeError{Err: fmt.Errorf("%w: '%d' is not a valid enum value of type SDPType", errPeerConnSDPTypeInvalidValue, sd.Type)}
 	}
 
@@ -1074,7 +1085,7 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error { 
 
 			kind := NewRTPCodecType(media.MediaName.Media)
 			direction := getPeerDirection(media)
-			if kind == 0 || direction == RTPTransceiverDirection(Unknown) {
+			if kind == 0 || direction == RTPTransceiverDirectionUnknown {
 				continue
 			}
 
@@ -1274,7 +1285,7 @@ func setRTPTransceiverCurrentDirection(answer *SessionDescription, currentTransc
 		}
 
 		direction := getPeerDirection(media)
-		if direction == RTPTransceiverDirection(Unknown) {
+		if direction == RTPTransceiverDirectionUnknown {
 			continue
 		}
 
@@ -1660,17 +1671,17 @@ func (pc *PeerConnection) undeclaredRTPMediaProcessor() {
 			continue
 		}
 
+		pc.dtlsTransport.storeSimulcastStream(stream)
+
 		if atomic.AddUint64(&simulcastRoutineCount, 1) >= simulcastMaxProbeRoutines {
 			atomic.AddUint64(&simulcastRoutineCount, ^uint64(0))
 			pc.log.Warn(ErrSimulcastProbeOverflow.Error())
-			pc.dtlsTransport.storeSimulcastStream(stream)
 			continue
 		}
 
 		go func(rtpStream io.Reader, ssrc SSRC) {
 			if err := pc.handleIncomingSSRC(rtpStream, ssrc); err != nil {
 				pc.log.Errorf(incomingUnhandledRTPSsrc, ssrc, err)
-				pc.dtlsTransport.storeSimulcastStream(stream)
 			}
 			atomic.AddUint64(&simulcastRoutineCount, ^uint64(0))
 		}(stream, SSRC(ssrc))
@@ -1854,7 +1865,7 @@ func (pc *PeerConnection) RemoveTrack(sender *RTPSender) (err error) {
 	return
 }
 
-func (pc *PeerConnection) newTransceiverFromTrack(direction RTPTransceiverDirection, track TrackLocal) (t *RTPTransceiver, err error) {
+func (pc *PeerConnection) newTransceiverFromTrack(direction RTPTransceiverDirection, track TrackLocal, init ...RTPTransceiverInit) (t *RTPTransceiver, err error) {
 	var (
 		r *RTPReceiver
 		s *RTPSender
@@ -1874,6 +1885,13 @@ func (pc *PeerConnection) newTransceiverFromTrack(direction RTPTransceiverDirect
 	if err != nil {
 		return
 	}
+
+	// Allow RTPTransceiverInit to override SSRC
+	if s != nil && len(s.trackEncodings) == 1 &&
+		len(init) == 1 && len(init[0].SendEncodings) == 1 && init[0].SendEncodings[0].SSRC != 0 {
+		s.trackEncodings[0].ssrc = init[0].SendEncodings[0].SSRC
+	}
+
 	return newRTPTransceiver(r, s, direction, track.Kind(), pc.api), nil
 }
 
@@ -1899,7 +1917,7 @@ func (pc *PeerConnection) AddTransceiverFromKind(kind RTPCodecType, init ...RTPT
 		if err != nil {
 			return nil, err
 		}
-		t, err = pc.newTransceiverFromTrack(direction, track)
+		t, err = pc.newTransceiverFromTrack(direction, track, init...)
 		if err != nil {
 			return nil, err
 		}
@@ -1931,7 +1949,7 @@ func (pc *PeerConnection) AddTransceiverFromTrack(track TrackLocal, init ...RTPT
 		direction = init[0].Direction
 	}
 
-	t, err = pc.newTransceiverFromTrack(direction, track)
+	t, err = pc.newTransceiverFromTrack(direction, track, init...)
 	if err == nil {
 		pc.mu.Lock()
 		pc.addRTPTransceiver(t)
@@ -2261,6 +2279,16 @@ func (pc *PeerConnection) startTransports(iceRole ICERole, dtlsRole DTLSRole, re
 		return
 	}
 
+	pc.dtlsTransport.internalOnCloseHandler = func() {
+		pc.log.Info("Closing PeerConnection from DTLS CloseNotify")
+
+		go func() {
+			if pcClosErr := pc.Close(); pcClosErr != nil {
+				pc.log.Warnf("Failed to close PeerConnection from DTLS CloseNotify: %s", pcClosErr)
+			}
+		}()
+	}
+
 	// Start the dtls transport
 	err = pc.dtlsTransport.Start(DTLSParameters{
 		Role:         dtlsRole,
@@ -2353,7 +2381,7 @@ func (pc *PeerConnection) generateUnmatchedSDP(transceivers []*RTPTransceiver, u
 		return nil, err
 	}
 
-	return populateSDP(d, isPlanB, dtlsFingerprints, pc.api.settingEngine.sdpMediaLevelFingerprints, pc.api.settingEngine.candidates.ICELite, true, pc.api.mediaEngine, connectionRoleFromDtlsRole(defaultDtlsRoleOffer), candidates, iceParams, mediaSections, pc.ICEGatheringState())
+	return populateSDP(d, isPlanB, dtlsFingerprints, pc.api.settingEngine.sdpMediaLevelFingerprints, pc.api.settingEngine.candidates.ICELite, true, pc.api.mediaEngine, connectionRoleFromDtlsRole(defaultDtlsRoleOffer), candidates, iceParams, mediaSections, pc.ICEGatheringState(), nil)
 }
 
 // generateMatchedSDP generates a SDP and takes the remote state into account
@@ -2404,7 +2432,7 @@ func (pc *PeerConnection) generateMatchedSDP(transceivers []*RTPTransceiver, use
 
 		kind := NewRTPCodecType(media.MediaName.Media)
 		direction := getPeerDirection(media)
-		if kind == 0 || direction == RTPTransceiverDirection(Unknown) {
+		if kind == 0 || direction == RTPTransceiverDirectionUnknown {
 			continue
 		}
 
@@ -2451,6 +2479,7 @@ func (pc *PeerConnection) generateMatchedSDP(transceivers []*RTPTransceiver, use
 		}
 	}
 
+	var bundleGroup *string
 	// If we are offering also include unmatched local transceivers
 	if includeUnmatched {
 		if !detectedPlanB {
@@ -2469,6 +2498,10 @@ func (pc *PeerConnection) generateMatchedSDP(transceivers []*RTPTransceiver, use
 				mediaSections = append(mediaSections, mediaSection{id: strconv.Itoa(len(mediaSections)), data: true})
 			}
 		}
+	} else if remoteDescription != nil {
+		groupValue, _ := remoteDescription.parsed.Attribute(sdp.AttrKeyGroup)
+		groupValue = strings.TrimLeft(groupValue, "BUNDLE")
+		bundleGroup = &groupValue
 	}
 
 	if pc.configuration.SDPSemantics == SDPSemanticsUnifiedPlanWithFallback && detectedPlanB {
@@ -2480,7 +2513,7 @@ func (pc *PeerConnection) generateMatchedSDP(transceivers []*RTPTransceiver, use
 		return nil, err
 	}
 
-	return populateSDP(d, detectedPlanB, dtlsFingerprints, pc.api.settingEngine.sdpMediaLevelFingerprints, pc.api.settingEngine.candidates.ICELite, isExtmapAllowMixed, pc.api.mediaEngine, connectionRole, candidates, iceParams, mediaSections, pc.ICEGatheringState())
+	return populateSDP(d, detectedPlanB, dtlsFingerprints, pc.api.settingEngine.sdpMediaLevelFingerprints, pc.api.settingEngine.candidates.ICELite, isExtmapAllowMixed, pc.api.mediaEngine, connectionRole, candidates, iceParams, mediaSections, pc.ICEGatheringState(), bundleGroup)
 }
 
 func (pc *PeerConnection) setGatherCompleteHandler(handler func()) {

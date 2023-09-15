@@ -7,8 +7,7 @@ during a session and why.
 ## Instructions
 ### Download stats
 ```
-export GO111MODULE=on
-go get github.com/pion/webrtc/v3/examples/stats
+go install github.com/pion/webrtc/v4/examples/stats@latest
 ```
 
 ### Open stats example page

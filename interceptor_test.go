@@ -16,8 +16,8 @@ import (
 	"github.com/pion/interceptor"
 	mock_interceptor "github.com/pion/interceptor/pkg/mock"
 	"github.com/pion/rtp"
-	"github.com/pion/transport/v2/test"
-	"github.com/pion/webrtc/v3/pkg/media"
+	"github.com/pion/transport/v3/test"
+	"github.com/pion/webrtc/v4/pkg/media"
 	"github.com/stretchr/testify/assert"
 )
 

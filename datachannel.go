@@ -17,7 +17,7 @@ import (
 
 	"github.com/pion/datachannel"
 	"github.com/pion/logging"
-	"github.com/pion/webrtc/v3/pkg/rtcerr"
+	"github.com/pion/webrtc/v4/pkg/rtcerr"
 )
 
 const dataChannelBufferSize = math.MaxUint16 // message size limit for Chromium
@@ -578,7 +578,7 @@ func (d *DataChannel) SetBufferedAmountLowThreshold(th uint64) {
 }
 
 // OnBufferedAmountLow sets an event handler which is invoked when
-// the number of bytes of outgoing data becomes lower than the
+// the number of bytes of outgoing data becomes lower than or equal to the
 // BufferedAmountLowThreshold.
 func (d *DataChannel) OnBufferedAmountLow(f func()) {
 	d.mu.Lock()
