@@ -7,6 +7,7 @@
 package webrtc
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
 	"sync"
@@ -31,11 +32,17 @@ type trackStreams struct {
 	rtcpReadStream  *srtp.ReadStreamSRTCP
 	rtcpInterceptor interceptor.RTCPReader
 
-	repairReadStream  *srtp.ReadStreamSRTP
-	repairInterceptor interceptor.RTPReader
+	repairReadStream    *srtp.ReadStreamSRTP
+	repairInterceptor   interceptor.RTPReader
+	repairStreamChannel chan rtxPacketWithAttributes
 
 	repairRtcpReadStream  *srtp.ReadStreamSRTCP
 	repairRtcpInterceptor interceptor.RTCPReader
+}
+
+type rtxPacketWithAttributes struct {
+	pkt        []byte
+	attributes interceptor.Attributes
 }
 
 // RTPReceiver allows an application to inspect the receipt of a TrackRemote
@@ -145,6 +152,7 @@ func (r *RTPReceiver) configureReceive(parameters RTPReceiveParameters) {
 			track: newTrackRemote(
 				r.kind,
 				parameters.Encodings[i].SSRC,
+				parameters.Encodings[i].RTX.SSRC,
 				parameters.Encodings[i].RID,
 				r,
 			),
@@ -388,8 +396,6 @@ func (r *RTPReceiver) receiveForRid(rid string, params RTPParameters, streamInfo
 }
 
 // receiveForRtx starts a routine that processes the repair stream
-// These packets aren't exposed to the user yet, but we need to process them for
-// TWCC
 func (r *RTPReceiver) receiveForRtx(ssrc SSRC, rsid string, streamInfo *interceptor.StreamInfo, rtpReadStream *srtp.ReadStreamSRTP, rtpInterceptor interceptor.RTPReader, rtcpReadStream *srtp.ReadStreamSRTCP, rtcpInterceptor interceptor.RTCPReader) error {
 	var track *trackStreams
 	if ssrc != 0 && len(r.tracks) == 1 {
@@ -411,12 +417,50 @@ func (r *RTPReceiver) receiveForRtx(ssrc SSRC, rsid string, streamInfo *intercep
 	track.repairInterceptor = rtpInterceptor
 	track.repairRtcpReadStream = rtcpReadStream
 	track.repairRtcpInterceptor = rtcpInterceptor
+	track.repairStreamChannel = make(chan rtxPacketWithAttributes)
 
 	go func() {
 		b := make([]byte, r.api.settingEngine.getReceiveMTU())
 		for {
-			if _, _, readErr := track.repairInterceptor.Read(b, nil); readErr != nil {
+			i, attributes, err := track.repairInterceptor.Read(b, nil)
+			if err != nil {
 				return
+			}
+
+			// RTX packets have a different payload format. Move the OSN in the payload to the RTP header and rewrite the
+			// payload type and SSRC, so that we can return RTX packets to the caller 'transparently' i.e. in the same format
+			// as non-RTX RTP packets
+			hasExtension := b[0]&0b10000 > 0
+			hasPadding := b[0]&0b100000 > 0
+			csrcCount := b[0] & 0b1111
+			headerLength := uint16(12 + (4 * csrcCount))
+			paddingLength := 0
+			if hasExtension {
+				headerLength += 4 * (1 + binary.BigEndian.Uint16(b[headerLength+2:headerLength+4]))
+			}
+			if hasPadding {
+				paddingLength = int(b[i-1])
+			}
+
+			if i-int(headerLength)-paddingLength < 2 {
+				// BWE probe packet, ignore
+				continue
+			}
+
+			attributes.Set(attributeRtxPayloadType, b[1]&0x7F)
+			attributes.Set(attributeRtxSequenceNumber, binary.BigEndian.Uint16(b[2:4]))
+			attributes.Set(attributeRtxSsrc, binary.BigEndian.Uint32(b[8:12]))
+
+			b[1] = (b[1] & 0x80) | uint8(track.track.PayloadType())
+			b[2] = b[headerLength]
+			b[3] = b[headerLength+1]
+			binary.BigEndian.PutUint32(b[8:12], uint32(track.track.SSRC()))
+			copy(b[headerLength:i-2], b[headerLength+2:i])
+
+			select {
+			case <-r.closed:
+				return
+			case track.repairStreamChannel <- rtxPacketWithAttributes{pkt: b[:i-2], attributes: attributes}:
 			}
 		}
 	}()
@@ -454,4 +498,26 @@ func (r *RTPReceiver) setRTPReadDeadline(deadline time.Time, reader *TrackRemote
 		return t.rtpReadStream.SetReadDeadline(deadline)
 	}
 	return fmt.Errorf("%w: %d", errRTPReceiverWithSSRCTrackStreamNotFound, reader.SSRC())
+}
+
+// readRTX returns an RTX packet if one is available on the RTX track, otherwise returns nil
+func (r *RTPReceiver) readRTX(reader *TrackRemote) *rtxPacketWithAttributes {
+	if !reader.HasRTX() {
+		return nil
+	}
+
+	select {
+	case <-r.received:
+	default:
+		return nil
+	}
+
+	if t := r.streamsForTrack(reader); t != nil {
+		select {
+		case rtxPacketReceived := <-t.repairStreamChannel:
+			return &rtxPacketReceived
+		default:
+		}
+	}
+	return nil
 }
