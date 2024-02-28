@@ -144,10 +144,10 @@ func (s *SampleBuilder) purgeConsumedLocation(consume sampleSequenceLocation, fo
 
 // purgeBuffers flushes all buffers that are already consumed or those buffers
 // that are too late to consume.
-func (s *SampleBuilder) purgeBuffers() {
+func (s *SampleBuilder) purgeBuffers(flush bool) {
 	s.purgeConsumedBuffers()
 
-	for (s.tooOld(s.filled) || (s.filled.count() > s.maxLate)) && s.filled.hasData() {
+	for (s.tooOld(s.filled) || (s.filled.count() > s.maxLate) || flush) && s.filled.hasData() {
 		if s.active.empty() {
 			// refill the active based on the filled packets
 			s.active = s.filled
@@ -188,7 +188,12 @@ func (s *SampleBuilder) Push(p *rtp.Packet) {
 	case slCompareInside:
 		break
 	}
-	s.purgeBuffers()
+	s.purgeBuffers(false)
+}
+
+// Flush marks all samples in the buffer to be popped.
+func (s *SampleBuilder) Flush() {
+	s.purgeBuffers(true)
 }
 
 const secondToNanoseconds = 1000000000
@@ -272,13 +277,17 @@ func (s *SampleBuilder) buildSample(purgingBuffers bool) *media.Sample {
 	// merge all the buffers into a sample
 	data := []byte{}
 	var metadata interface{}
+	var rtpHeader rtp.Header
 	for i := consume.head; i != consume.tail; i++ {
 		p, err := s.depacketizer.Unmarshal(s.buffer[i].Payload)
 		if err != nil {
 			return nil
 		}
-		if i == consume.head && s.packetHeadHandler != nil {
-			metadata = s.packetHeadHandler(s.depacketizer)
+		if i == consume.head {
+			if s.packetHeadHandler != nil {
+				metadata = s.packetHeadHandler(s.depacketizer)
+			}
+			rtpHeader = s.buffer[i].Header.Clone()
 		}
 
 		data = append(data, p...)
@@ -291,6 +300,7 @@ func (s *SampleBuilder) buildSample(purgingBuffers bool) *media.Sample {
 		PacketTimestamp:    sampleTimestamp,
 		PrevDroppedPackets: s.droppedPackets,
 		Metadata:           metadata,
+		RTPHeader:          &rtpHeader,
 	}
 
 	s.droppedPackets = 0
