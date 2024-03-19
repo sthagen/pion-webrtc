@@ -75,6 +75,8 @@ type SettingEngine struct {
 	}
 	sctp struct {
 		maxReceiveBufferSize uint32
+		enableZeroChecksum   bool
+		rtoMax               time.Duration
 	}
 	sdpMediaLevelFingerprints                 bool
 	answeringDTLSRole                         DTLSRole
@@ -432,8 +434,21 @@ func (e *SettingEngine) SetSCTPMaxReceiveBufferSize(maxReceiveBufferSize uint32)
 	e.sctp.maxReceiveBufferSize = maxReceiveBufferSize
 }
 
+// EnableSCTPZeroChecksum controls the zero checksum feature in SCTP.
+// This removes the need to checksum every incoming/outgoing packet and will reduce
+// latency and CPU usage. This feature is not backwards compatible so is disabled by default
+func (e *SettingEngine) EnableSCTPZeroChecksum(isEnabled bool) {
+	e.sctp.enableZeroChecksum = isEnabled
+}
+
 // SetDTLSCustomerCipherSuites allows the user to specify a list of DTLS CipherSuites.
 // This allow usage of Ciphers that are reserved for private usage.
 func (e *SettingEngine) SetDTLSCustomerCipherSuites(customCipherSuites func() []dtls.CipherSuite) {
 	e.dtls.customCipherSuites = customCipherSuites
+}
+
+// SetSCTPRTOMax sets the maximum retransmission timeout.
+// Leave this 0 for the default timeout.
+func (e *SettingEngine) SetSCTPRTOMax(rtoMax time.Duration) {
+	e.sctp.rtoMax = rtoMax
 }

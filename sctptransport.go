@@ -105,12 +105,12 @@ func (r *SCTPTransport) Start(SCTPCapabilities) error {
 	if dtlsTransport == nil || dtlsTransport.conn == nil {
 		return errSCTPTransportDTLS
 	}
-
 	sctpAssociation, err := sctp.Client(sctp.Config{
 		NetConn:              dtlsTransport.conn,
 		MaxReceiveBufferSize: r.api.settingEngine.sctp.maxReceiveBufferSize,
-		EnableZeroChecksum:   true,
+		EnableZeroChecksum:   r.api.settingEngine.sctp.enableZeroChecksum,
 		LoggerFactory:        r.api.settingEngine.LoggerFactory,
+		RTOMax:               float64(r.api.settingEngine.sctp.rtoMax) / float64(time.Millisecond),
 	})
 	if err != nil {
 		return err
