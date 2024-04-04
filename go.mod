@@ -5,13 +5,13 @@ go 1.19
 require (
 	github.com/pion/datachannel v1.5.6
 	github.com/pion/dtls/v2 v2.2.10
-	github.com/pion/ice/v3 v3.0.4
+	github.com/pion/ice/v3 v3.0.5
 	github.com/pion/interceptor v0.1.27
 	github.com/pion/logging v0.2.2
 	github.com/pion/randutil v0.1.0
 	github.com/pion/rtcp v1.2.14
 	github.com/pion/rtp v1.8.5
-	github.com/pion/sctp v1.8.13
+	github.com/pion/sctp v1.8.14
 	github.com/pion/sdp/v3 v3.0.9
 	github.com/pion/srtp/v3 v3.0.1
 	github.com/pion/stun/v2 v2.0.0
