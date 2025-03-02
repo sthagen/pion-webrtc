@@ -12,7 +12,7 @@ import (
 
 	"github.com/pion/rtp"
 	"github.com/pion/rtp/codecs"
-	"github.com/pion/rtp/codecs/av1/frame"
+	"github.com/pion/rtp/codecs/av1/obu"
 )
 
 var (
@@ -44,7 +44,7 @@ type (
 		currentFrame []byte
 
 		// AV1
-		av1Frame frame.AV1
+		av1Depacketizer *codecs.AV1Depacketizer
 	}
 )
 
@@ -97,7 +97,6 @@ func NewWith(out io.Writer, opts ...Option) (*IVFWriter, error) {
 	if writer.codec == codecUnset {
 		writer.codec = codecVP8
 	}
-
 	if err := writer.writeHeader(); err != nil {
 		return nil, err
 	}
@@ -159,7 +158,7 @@ func (i *IVFWriter) writeFrame(frame []byte, timestamp uint64) error {
 }
 
 // WriteRTP adds a new packet and writes the appropriate headers for it.
-func (i *IVFWriter) WriteRTP(packet *rtp.Packet) error { //nolint:cyclop, gocognit
+func (i *IVFWriter) WriteRTP(packet *rtp.Packet) error {
 	if i.ioWriter == nil {
 		return errFileNotOpened
 	} else if len(packet.Payload) == 0 {
@@ -173,79 +172,114 @@ func (i *IVFWriter) WriteRTP(packet *rtp.Packet) error { //nolint:cyclop, gocogn
 
 	switch i.codec {
 	case codecVP8:
-		vp8Packet := codecs.VP8Packet{}
-		if _, err := vp8Packet.Unmarshal(packet.Payload); err != nil {
-			return err
-		}
-
-		isKeyFrame := (vp8Packet.Payload[0] & 0x01) == 0
-		switch {
-		case !i.seenKeyFrame && !isKeyFrame:
-			return nil
-		case i.currentFrame == nil && vp8Packet.S != 1:
-			return nil
-		}
-
-		i.seenKeyFrame = true
-		i.currentFrame = append(i.currentFrame, vp8Packet.Payload[0:]...)
-
-		if !packet.Marker {
-			return nil
-		} else if len(i.currentFrame) == 0 {
-			return nil
-		}
-
-		if err := i.writeFrame(i.currentFrame, relativeTstampMs); err != nil {
-			return err
-		}
-		i.currentFrame = nil
+		return i.writeVP8(packet, relativeTstampMs)
 	case codecVP9:
-		vp9Packet := codecs.VP9Packet{}
-		if _, err := vp9Packet.Unmarshal(packet.Payload); err != nil {
-			return err
-		}
-
-		switch {
-		case !i.seenKeyFrame && vp9Packet.P:
-			return nil
-		case i.currentFrame == nil && !vp9Packet.B:
-			return nil
-		}
-
-		i.seenKeyFrame = true
-		i.currentFrame = append(i.currentFrame, vp9Packet.Payload[0:]...)
-
-		if !packet.Marker {
-			return nil
-		} else if len(i.currentFrame) == 0 {
-			return nil
-		}
-
-		// the timestamp must be sequential. webrtc mandates a clock rate of 90000
-		// and we've assumed 30fps in the header.
-		if err := i.writeFrame(i.currentFrame, relativeTstampMs); err != nil {
-			return err
-		}
-		i.currentFrame = nil
+		return i.writeVP9(packet, relativeTstampMs)
 	case codecAV1:
-		av1Packet := &codecs.AV1Packet{}
-		if _, err := av1Packet.Unmarshal(packet.Payload); err != nil {
-			return err
-		}
-
-		obus, err := i.av1Frame.ReadFrames(av1Packet)
-		if err != nil {
-			return err
-		}
-
-		for j := range obus {
-			if err := i.writeFrame(obus[j], relativeTstampMs); err != nil {
-				return err
-			}
-		}
+		return i.writeAV1(packet, relativeTstampMs)
 	default:
 		return errCodecUnset
 	}
+}
+
+func (i *IVFWriter) writeVP8(packet *rtp.Packet, timestamp uint64) error {
+	vp8Packet := codecs.VP8Packet{}
+	if _, err := vp8Packet.Unmarshal(packet.Payload); err != nil {
+		return err
+	}
+
+	isKeyFrame := (vp8Packet.Payload[0] & 0x01) == 0
+	switch {
+	case !i.seenKeyFrame && !isKeyFrame:
+		return nil
+	case i.currentFrame == nil && vp8Packet.S != 1:
+		return nil
+	}
+
+	i.seenKeyFrame = true
+	i.currentFrame = append(i.currentFrame, vp8Packet.Payload[0:]...)
+
+	if !packet.Marker {
+		return nil
+	} else if len(i.currentFrame) == 0 {
+		return nil
+	}
+
+	if err := i.writeFrame(i.currentFrame, timestamp); err != nil {
+		return err
+	}
+	i.currentFrame = nil
+
+	return nil
+}
+
+func (i *IVFWriter) writeVP9(packet *rtp.Packet, timestamp uint64) error {
+	vp9Packet := codecs.VP9Packet{}
+	if _, err := vp9Packet.Unmarshal(packet.Payload); err != nil {
+		return err
+	}
+
+	switch {
+	case !i.seenKeyFrame && vp9Packet.P:
+		return nil
+	case i.currentFrame == nil && !vp9Packet.B:
+		return nil
+	}
+
+	i.seenKeyFrame = true
+	i.currentFrame = append(i.currentFrame, vp9Packet.Payload[0:]...)
+
+	if !packet.Marker {
+		return nil
+	} else if len(i.currentFrame) == 0 {
+		return nil
+	}
+
+	// the timestamp must be sequential. webrtc mandates a clock rate of 90000
+	// and we've assumed 30fps in the header.
+	if err := i.writeFrame(i.currentFrame, timestamp); err != nil {
+		return err
+	}
+	i.currentFrame = nil
+
+	return nil
+}
+
+func (i *IVFWriter) writeAV1(packet *rtp.Packet, timestamp uint64) error {
+	if i.av1Depacketizer == nil {
+		i.av1Depacketizer = &codecs.AV1Depacketizer{}
+	}
+
+	payload, err := i.av1Depacketizer.Unmarshal(packet.Payload)
+	if err != nil {
+		return err
+	}
+
+	if !i.seenKeyFrame {
+		isKeyFrame := i.av1Depacketizer.N || (len(payload) > 0 && obu.Type((payload[0]&0x78)>>3) == obu.OBUSequenceHeader)
+		if !isKeyFrame {
+			return nil
+		}
+
+		i.seenKeyFrame = true
+	}
+
+	i.currentFrame = append(i.currentFrame, payload...)
+	if !packet.Marker {
+		return nil
+	}
+
+	delimiter := obu.Header{
+		Type:         obu.OBUTemporalDelimiter,
+		HasSizeField: true,
+	}
+	frame := append(delimiter.Marshal(), 0)
+	frame = append(frame, i.currentFrame...)
+
+	if err := i.writeFrame(frame, timestamp); err != nil {
+		return err
+	}
+	i.currentFrame = nil
 
 	return nil
 }
