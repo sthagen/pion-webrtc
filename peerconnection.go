@@ -22,6 +22,7 @@ import (
 
 	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
+	"github.com/pion/interceptor/pkg/stats"
 	"github.com/pion/logging"
 	"github.com/pion/rtcp"
 	"github.com/pion/sdp/v3"
@@ -92,6 +93,7 @@ type PeerConnection struct {
 	log logging.LeveledLogger
 
 	interceptorRTCPWriter interceptor.RTCPWriter
+	statsGetter           stats.Getter
 }
 
 // NewPeerConnection creates a PeerConnection with the default codecs and interceptors.
@@ -143,9 +145,13 @@ func (api *API) NewPeerConnection(configuration Configuration) (*PeerConnection,
 	pc.iceConnectionState.Store(ICEConnectionStateNew)
 	pc.connectionState.Store(PeerConnectionStateNew)
 
-	i, err := api.interceptorRegistry.Build("")
+	i, err := api.interceptorRegistry.Build(pc.statsID)
 	if err != nil {
 		return nil, err
+	}
+
+	if getter, ok := lookupStats(pc.statsID); ok {
+		pc.statsGetter = getter
 	}
 
 	pc.api = &API{
@@ -2408,7 +2414,7 @@ func (pc *PeerConnection) close(shouldGracefullyClose bool) error { //nolint:cyc
 	// 2. A Mux stops this chain. It won't close the underlying
 	//    Conn if one of the endpoints is closed down. To
 	//    continue the chain the Mux has to be closed.
-	closeErrs := make([]error, 4)
+	closeErrs := make([]error, 0, 4)
 
 	doGracefulCloseOps := func() []error {
 		if !shouldGracefullyClose {
@@ -2442,10 +2448,10 @@ func (pc *PeerConnection) close(shouldGracefullyClose bool) error { //nolint:cyc
 	// https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-close (step #4)
 	pc.mu.Lock()
 	for _, t := range pc.rtpTransceivers {
-		closeErrs = append(closeErrs, t.Stop()) //nolint:makezero // todo fix
+		closeErrs = append(closeErrs, t.Stop())
 	}
 	if nonMediaBandwidthProbe, ok := pc.nonMediaBandwidthProbe.Load().(*RTPReceiver); ok {
-		closeErrs = append(closeErrs, nonMediaBandwidthProbe.Stop()) //nolint:makezero // todo fix
+		closeErrs = append(closeErrs, nonMediaBandwidthProbe.Stop())
 	}
 	pc.mu.Unlock()
 
@@ -2458,25 +2464,28 @@ func (pc *PeerConnection) close(shouldGracefullyClose bool) error { //nolint:cyc
 
 	// https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-close (step #6)
 	if pc.sctpTransport != nil {
-		closeErrs = append(closeErrs, pc.sctpTransport.Stop()) //nolint:makezero // todo fix
+		closeErrs = append(closeErrs, pc.sctpTransport.Stop())
 	}
 
 	// https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-close (step #7)
-	closeErrs = append(closeErrs, pc.dtlsTransport.Stop()) //nolint:makezero // todo fix
+	closeErrs = append(closeErrs, pc.dtlsTransport.Stop())
 
 	// https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-close (step #8, #9, #10)
 	if pc.iceTransport != nil && !shouldGracefullyClose {
 		// we will stop gracefully in doGracefulCloseOps
-		closeErrs = append(closeErrs, pc.iceTransport.Stop()) //nolint:makezero // todo fix
+		closeErrs = append(closeErrs, pc.iceTransport.Stop())
 	}
 
 	// https://www.w3.org/TR/webrtc/#dom-rtcpeerconnection-close (step #11)
 	pc.updateConnectionState(pc.ICEConnectionState(), pc.dtlsTransport.State())
 
-	closeErrs = append(closeErrs, doGracefulCloseOps()...) //nolint:makezero // todo fix
+	closeErrs = append(closeErrs, doGracefulCloseOps()...)
+
+	pc.statsGetter = nil
+	cleanupStats(pc.statsID)
 
 	// Interceptor closes at the end to prevent Bind from being called after interceptor is closed
-	closeErrs = append(closeErrs, pc.api.interceptor.Close()) //nolint:makezero // todo fix
+	closeErrs = append(closeErrs, pc.api.interceptor.Close())
 
 	return util.FlattenErrs(closeErrs)
 }
@@ -2630,6 +2639,11 @@ func (pc *PeerConnection) GetStats() StatsReport {
 		}
 	}
 	pc.mu.Unlock()
+
+	receivers := pc.GetReceivers()
+	for _, receiver := range receivers {
+		receiver.collectStats(statsCollector, pc.statsGetter)
+	}
 
 	pc.api.mediaEngine.collectStats(statsCollector)
 
