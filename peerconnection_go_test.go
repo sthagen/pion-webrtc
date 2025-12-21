@@ -793,6 +793,70 @@ func TestMulticastDNSCandidates(t *testing.T) {
 	closePairNow(t, pcOffer, pcAnswer)
 }
 
+func TestMulticastDNSHostNameConnection(t *testing.T) {
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	offerHostName := fmt.Sprintf("pion-mdns-%s.local", strings.ToLower(util.MathRandAlpha(12)))
+	answerHostName := fmt.Sprintf("pion-mdns-%s.local", strings.ToLower(util.MathRandAlpha(12)))
+	for offerHostName == answerHostName {
+		answerHostName = fmt.Sprintf("pion-mdns-%s.local", strings.ToLower(util.MathRandAlpha(12)))
+	}
+
+	offerSettingEngine := SettingEngine{}
+	offerSettingEngine.SetICEMulticastDNSMode(ice.MulticastDNSModeQueryAndGather)
+	offerSettingEngine.SetMulticastDNSHostName(offerHostName)
+
+	answerSettingEngine := SettingEngine{}
+	answerSettingEngine.SetICEMulticastDNSMode(ice.MulticastDNSModeQueryAndGather)
+	answerSettingEngine.SetMulticastDNSHostName(answerHostName)
+
+	pcOffer, err := NewAPI(WithSettingEngine(offerSettingEngine)).NewPeerConnection(Configuration{})
+	assert.NoError(t, err)
+	if err != nil {
+		return
+	}
+
+	pcAnswer, err := NewAPI(WithSettingEngine(answerSettingEngine)).NewPeerConnection(Configuration{})
+	assert.NoError(t, err)
+	if err != nil {
+		return
+	}
+	defer closePairNow(t, pcOffer, pcAnswer)
+
+	connected := untilConnectionState(PeerConnectionStateConnected, pcOffer, pcAnswer)
+
+	assert.NoError(t, signalPair(pcOffer, pcAnswer))
+	connected.Wait()
+
+	offerLocal := pcOffer.LocalDescription()
+	assert.NotNil(t, offerLocal)
+	if offerLocal != nil {
+		assert.Contains(t, offerLocal.SDP, offerHostName)
+	}
+
+	answerLocal := pcAnswer.LocalDescription()
+	assert.NotNil(t, answerLocal)
+	if answerLocal != nil {
+		assert.Contains(t, answerLocal.SDP, answerHostName)
+	}
+
+	offerRemote := pcOffer.RemoteDescription()
+	assert.NotNil(t, offerRemote)
+	if offerRemote != nil {
+		assert.Contains(t, offerRemote.SDP, answerHostName)
+	}
+
+	answerRemote := pcAnswer.RemoteDescription()
+	assert.NotNil(t, answerRemote)
+	if answerRemote != nil {
+		assert.Contains(t, answerRemote.SDP, offerHostName)
+	}
+}
+
 func TestICERestart(t *testing.T) {
 	extractCandidates := func(sdp string) (candidates []string) {
 		sc := bufio.NewScanner(strings.NewReader(sdp))
@@ -1839,6 +1903,62 @@ func TestICETricklingSupported(t *testing.T) {
 	assert.NoError(t, pcAnswer.Close())
 }
 
+func TestICERenominationAdvertised(t *testing.T) {
+	report := test.CheckRoutines(t)
+	defer report()
+
+	offerSE := SettingEngine{}
+	assert.NoError(t, offerSE.SetICERenomination())
+
+	api := NewAPI(WithSettingEngine(offerSE))
+	pc, err := api.NewPeerConnection(Configuration{})
+	assert.NoError(t, err)
+
+	offer, err := pc.CreateOffer(nil)
+	assert.NoError(t, err)
+	assert.Contains(t, offer.SDP, "a=ice-options:renomination")
+	assert.NoError(t, pc.Close())
+
+	answerSE := SettingEngine{}
+	assert.NoError(t, answerSE.SetICERenomination())
+
+	apiAnswer := NewAPI(WithSettingEngine(answerSE))
+	pcAnswer, err := apiAnswer.NewPeerConnection(Configuration{})
+	assert.NoError(t, err)
+
+	offerSDP := strings.Join([]string{
+		"v=0",
+		"o=- 0 0 IN IP4 127.0.0.1",
+		"s=-",
+		"t=0 0",
+		"a=group:BUNDLE 0",
+		"a=ice-ufrag:someufrag",
+		"a=ice-pwd:somepwd",
+		"a=fingerprint:sha-256 " +
+			"F7:BF:B4:42:5B:44:C0:B9:49:70:6D:26:D7:3E:E6:08:B1:5B:25:2E:32:88:50:B6:3C:BE:4E:18:A7:2C:85:7C",
+		"a=msid-semantic: WMS *",
+		"m=audio 9 UDP/TLS/RTP/SAVPF 111",
+		"c=IN IP4 0.0.0.0",
+		"a=rtcp:9 IN IP4 0.0.0.0",
+		"a=mid:0",
+		"a=rtcp-mux",
+		"a=setup:actpass",
+		"a=rtpmap:111 opus/48000/2",
+		"",
+	}, "\r\n")
+
+	assert.NoError(t, pcAnswer.SetRemoteDescription(SessionDescription{
+		Type: SDPTypeOffer,
+		SDP:  offerSDP,
+	}))
+
+	answer, err := pcAnswer.CreateAnswer(nil)
+	assert.NoError(t, err)
+	assert.Contains(t, answer.SDP, "a=ice-options:renomination")
+
+	assert.NoError(t, pcAnswer.Close())
+}
+
 // https://github.com/pion/webrtc/issues/2690
 func TestPeerConnectionTrickleMediaStreamIdentification(t *testing.T) {
 	const remoteSdp = `v=0
@@ -2202,4 +2322,41 @@ func TestAddICECandidate__DroppingOldGenerationCandidates(t *testing.T) {
 	assert.Contains(t, testLogger.lastErrorMessage, "dropping candidate with ufrag")
 
 	closePairNow(t, pc, remotePC)
+}
+
+func TestPeerConnectionCanTrickleICECandidatesGo(t *testing.T) {
+	offerPC, answerPC, wan := createVNetPair(t, nil)
+	var err error
+	defer func() {
+		assert.NoError(t, wan.Stop())
+		closePairNow(t, offerPC, answerPC)
+	}()
+
+	_, err = offerPC.CreateDataChannel("trickle", nil)
+	assert.NoError(t, err)
+
+	offer, err := offerPC.CreateOffer(&OfferOptions{
+		OfferAnswerOptions: OfferAnswerOptions{ICETricklingSupported: true},
+	})
+	assert.NoError(t, err)
+	assert.NoError(t, offerPC.SetLocalDescription(offer))
+	assert.Equal(t, ICETrickleCapabilityUnknown, answerPC.CanTrickleICECandidates())
+	assert.NoError(t, answerPC.SetRemoteDescription(offer))
+	assert.Equal(t, ICETrickleCapabilitySupported, answerPC.CanTrickleICECandidates())
+
+	noTrickleOfferPC, noTrickleAnswerPC, noTrickleWAN := createVNetPair(t, nil)
+	defer func() {
+		assert.NoError(t, noTrickleWAN.Stop())
+		closePairNow(t, noTrickleOfferPC, noTrickleAnswerPC)
+	}()
+
+	_, err = noTrickleOfferPC.CreateDataChannel("notrickle", nil)
+	assert.NoError(t, err)
+
+	noTrickleOffer, err := noTrickleOfferPC.CreateOffer(nil)
+	assert.NoError(t, err)
+	assert.NoError(t, noTrickleOfferPC.SetLocalDescription(noTrickleOffer))
+	assert.Equal(t, ICETrickleCapabilityUnknown, noTrickleAnswerPC.CanTrickleICECandidates())
+	assert.NoError(t, noTrickleAnswerPC.SetRemoteDescription(noTrickleOffer))
+	assert.Equal(t, ICETrickleCapabilityUnsupported, noTrickleAnswerPC.CanTrickleICECandidates())
 }

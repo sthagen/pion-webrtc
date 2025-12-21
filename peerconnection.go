@@ -65,6 +65,8 @@ type PeerConnection struct {
 
 	lastOffer  string
 	lastAnswer string
+	// Whether the remote endpoint can accept trickled ICE candidates.
+	canTrickleICECandidates ICETrickleCapability
 
 	// a value containing the last known greater mid value
 	// we internally generate mids as numbers. Needed since JSEP
@@ -711,6 +713,7 @@ func (pc *PeerConnection) CreateOffer(options *OfferOptions) (SessionDescription
 				useIdentity,
 				true, /*includeUnmatched */
 				connectionRoleFromDtlsRole(defaultDtlsRoleOffer),
+				false,
 			)
 		}
 
@@ -720,6 +723,9 @@ func (pc *PeerConnection) CreateOffer(options *OfferOptions) (SessionDescription
 
 		if options != nil && options.ICETricklingSupported {
 			descr.WithICETrickleAdvertised()
+		}
+		if pc.api.settingEngine.renomination.enabled {
+			descr.WithICERenomination()
 		}
 
 		updateSDPOrigin(&pc.sdpOrigin, descr)
@@ -875,13 +881,22 @@ func (pc *PeerConnection) CreateAnswer(options *AnswerOptions) (SessionDescripti
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 
-	descr, err := pc.generateMatchedSDP(pc.rtpTransceivers, useIdentity, false /*includeUnmatched */, connectionRole)
+	descr, err := pc.generateMatchedSDP(
+		pc.rtpTransceivers,
+		useIdentity,
+		false, /*includeUnmatched */
+		connectionRole,
+		pc.api.settingEngine.ignoreRidPauseForRecv,
+	)
 	if err != nil {
 		return SessionDescription{}, err
 	}
 
 	if options != nil && options.ICETricklingSupported {
 		descr.WithICETrickleAdvertised()
+	}
+	if pc.api.settingEngine.renomination.enabled {
+		descr.WithICERenomination()
 	}
 
 	updateSDPOrigin(&pc.sdpOrigin, descr)
@@ -1104,6 +1119,7 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 	if _, err := desc.Unmarshal(); err != nil {
 		return err
 	}
+
 	if err := pc.setDescription(&desc, stateChangeOpSetRemote); err != nil {
 		return err
 	}
@@ -1111,6 +1127,20 @@ func (pc *PeerConnection) SetRemoteDescription(desc SessionDescription) error {
 	if err := pc.api.mediaEngine.updateFromRemoteDescription(*desc.parsed); err != nil {
 		return err
 	}
+
+	canTrickle := hasICETrickleOption(desc.parsed)
+	pc.mu.Lock()
+	switch desc.Type {
+	case SDPTypeOffer, SDPTypeAnswer, SDPTypePranswer:
+		if canTrickle {
+			pc.canTrickleICECandidates = ICETrickleCapabilitySupported
+		} else {
+			pc.canTrickleICECandidates = ICETrickleCapabilityUnsupported
+		}
+	default:
+		pc.canTrickleICECandidates = ICETrickleCapabilityUnknown
+	}
+	pc.mu.Unlock()
 
 	// Disable RTX/FEC on RTPSenders if the remote didn't support it
 	for _, sender := range pc.GetSenders() {
@@ -2583,6 +2613,15 @@ func (pc *PeerConnection) PendingRemoteDescription() *SessionDescription {
 	return pc.pendingRemoteDescription
 }
 
+// CanTrickleICECandidates reports whether the remote endpoint indicated
+// support for receiving trickled ICE candidates.
+func (pc *PeerConnection) CanTrickleICECandidates() ICETrickleCapability {
+	pc.mu.RLock()
+	defer pc.mu.RUnlock()
+
+	return pc.canTrickleICECandidates
+}
+
 // SignalingState attribute returns the signaling state of the
 // PeerConnection instance.
 func (pc *PeerConnection) SignalingState() SignalingState {
@@ -2835,6 +2874,7 @@ func (pc *PeerConnection) generateUnmatchedSDP(
 		pc.ICEGatheringState(),
 		nil,
 		pc.api.settingEngine.getSCTPMaxMessageSize(),
+		false,
 	)
 }
 
@@ -2846,6 +2886,7 @@ func (pc *PeerConnection) generateMatchedSDP(
 	transceivers []*RTPTransceiver,
 	useIdentity, includeUnmatched bool,
 	connectionRole sdp.ConnectionRole,
+	ignoreRidPauseForRecv bool,
 ) (*sdp.SessionDescription, error) {
 	desc, err := sdp.NewJSEPSessionDescription(useIdentity)
 	if err != nil {
@@ -3005,6 +3046,7 @@ func (pc *PeerConnection) generateMatchedSDP(
 		pc.ICEGatheringState(),
 		bundleGroup,
 		pc.api.settingEngine.getSCTPMaxMessageSize(),
+		ignoreRidPauseForRecv,
 	)
 }
 
