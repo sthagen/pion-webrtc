@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pion/transport/v3/test"
+	"github.com/pion/transport/v4/test"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -142,6 +142,36 @@ func TestPeerConnection_Close_DuringICE(t *testing.T) { //nolint:cyclop
 	case <-closedOffer:
 	case <-time.After(5 * time.Second):
 		assert.Fail(t, "pcOffer.Close() Timeout")
+	}
+}
+
+func TestPeerConnection_Close_DuringICEGathering(t *testing.T) { //nolint:cyclop
+	// Limit runtime in case of deadlocks
+	lim := test.TimeOut(time.Second * 30)
+	defer lim.Stop()
+
+	report := test.CheckRoutines(t)
+	defer report()
+
+	pcOffer, pcAnswer, err := newPair()
+	assert.NoError(t, err)
+
+	_, err = pcOffer.CreateDataChannel("test-channel", nil)
+	assert.NoError(t, err)
+
+	offer, err := pcOffer.CreateOffer(nil)
+	assert.NoError(t, err)
+
+	offerGatheringComplete := GatheringCompletePromise(pcOffer)
+	assert.NoError(t, pcOffer.SetLocalDescription(offer))
+
+	assert.NoError(t, pcOffer.Close())
+	assert.NoError(t, pcAnswer.Close())
+
+	select {
+	case <-offerGatheringComplete:
+	case <-time.After(1 * time.Second):
+		assert.Fail(t, "Gathering Complete promise did not complete when PC closed")
 	}
 }
 
