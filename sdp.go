@@ -90,9 +90,8 @@ func trackDetailsFromSDP(
 		trackID := ""
 
 		// If media section is recvonly or inactive skip
-		if _, ok := media.Attribute(sdp.AttrKeyRecvOnly); ok {
-			continue
-		} else if _, ok := media.Attribute(sdp.AttrKeyInactive); ok {
+		direction := getPeerDirection(media, s)
+		if direction == RTPTransceiverDirectionRecvonly || direction == RTPTransceiverDirectionInactive {
 			continue
 		}
 
@@ -870,14 +869,18 @@ func descriptionPossiblyPlanB(desc *SessionDescription) bool {
 	return false
 }
 
-func getPeerDirection(media *sdp.MediaDescription) RTPTransceiverDirection {
-	for _, a := range media.Attributes {
-		if direction := NewRTPTransceiverDirection(a.Key); direction != RTPTransceiverDirectionUnknown {
-			return direction
+// getPeerDirection resolves media direction according to
+// https://www.rfc-editor.org/rfc/rfc8866.html#section-6.7
+func getPeerDirection(media *sdp.MediaDescription, session *sdp.SessionDescription) RTPTransceiverDirection {
+	for _, attributes := range [][]sdp.Attribute{media.Attributes, session.Attributes} {
+		for _, attribute := range attributes {
+			if direction := NewRTPTransceiverDirection(attribute.Key); direction != RTPTransceiverDirectionUnknown {
+				return direction
+			}
 		}
 	}
 
-	return RTPTransceiverDirectionUnknown
+	return RTPTransceiverDirectionSendrecv
 }
 
 func extractBundleID(desc *sdp.SessionDescription) string {
@@ -1123,6 +1126,7 @@ func codecsFromMediaDescription(mediaDescr *sdp.MediaDescription) (out []RTPCode
 	s := &sdp.SessionDescription{
 		MediaDescriptions: []*sdp.MediaDescription{mediaDescr},
 	}
+	codecMap := s.GetCodecMap()
 
 	for _, payloadStr := range mediaDescr.MediaName.Formats {
 		payloadType, err := strconv.ParseUint(payloadStr, 10, 8)
@@ -1130,13 +1134,13 @@ func codecsFromMediaDescription(mediaDescr *sdp.MediaDescription) (out []RTPCode
 			return nil, err
 		}
 
-		codec, err := s.GetCodecForPayloadType(uint8(payloadType))
-		if err != nil {
+		codec, ok := codecMap[uint8(payloadType)]
+		if !ok {
 			if payloadType == 0 {
 				continue
 			}
 
-			return nil, err
+			return nil, fmt.Errorf("%w: payload type %d", errSDPPayloadTypeNotFound, payloadType)
 		}
 
 		channels := uint16(0)
